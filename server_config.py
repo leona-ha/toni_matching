@@ -1,0 +1,1 @@
+DATA_PATH = "/sc-projects/sc-proj-cc15-preact/SP6/toni"
