@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from scipy import sparse
+from collections import Counter
 
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.pipeline import Pipeline
@@ -22,16 +23,23 @@ from sklearn.impute import IterativeImputer
 from pandas.api import types as pdt
 import warnings
 
-# Optional: statsmodels for proportional-odds etc.
+# ----- statsmodels -----
+_HAS_SM_ORD = True
+_SM_ORD_ERR = None
 try:
     from statsmodels.miscmodels.ordinal_model import OrderedModel
-    _HAS_SM_ORD = True
-    _SM_ORD_ERR = None
 except Exception as e:
     _HAS_SM_ORD = False
     _SM_ORD_ERR = e
 
-# Optional: correlations
+_HAS_SM = True
+try:
+    import statsmodels.api as sm
+    from scipy.stats import chi2
+except Exception:
+    _HAS_SM = False
+
+# ----- correlations -----
 try:
     from scipy.stats import spearmanr, kendalltau
     _HAS_SPEARMAN = True
@@ -44,7 +52,7 @@ except Exception:
         _HAS_SPEARMAN = False
     _HAS_KENDALL = False
 
-# Torch FM
+# ----- Torch FM -----
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -69,10 +77,8 @@ class MatchConfig:
     GAD7_T0_COL: Optional[str] = None
     GAD7_T1_COL: Optional[str] = None
 
-    # Precomputed or computed label
+    # Precomputed or computed label (positive = improvement)
     LABEL_COL: str = "delta_distress"
-
-    # Direction: True if larger values = better outcome (improvement)
     OUTCOME_HIGHER_IS_BETTER: bool = True
 
     # ---- Features ----
@@ -80,45 +86,53 @@ class MatchConfig:
     patient_categorical: List[str] = field(default_factory=list)
     therapist_numeric: List[str] = field(default_factory=list)
     therapist_categorical: List[str] = field(default_factory=list)
-
-    # ---- Optional: include therapist_id as categorical (one-hot)
     include_therapist_id_feature: bool = False
 
-    # ---- FM hyperparameter grid (Torch FM)
+    # ---- Imputation ----
+    impute_strategy: str = "iterative"   # "median" | "iterative"
+    iterative_imputer_params: Dict[str, object] = field(default_factory=lambda: {
+        "max_iter": 10, "initial_strategy": "median", "random_state": 0, "sample_posterior": True,
+    })
+
+    # ---- Models / HPO ----
     fm_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        "regressor__k": [8, 16, 32, 64],
+        "regressor__k": [4,8, 16, 32],
         "regressor__lr": [1e-3, 5e-4],
         "regressor__n_epochs": [40],
-        "regressor__batch_size": [256, 128],
+        "regressor__batch_size": [256],
         "regressor__weight_decay": [0.0, 1e-5],
     })
-
-    # ---- Imputation (uniform for all numeric features) ----
-    impute_strategy: str = "median"              # "median" or "iterative"
-    iterative_imputer_params: Dict[str, object] = field(default_factory=lambda: {
-        "max_iter": 10,
-        "initial_strategy": "median",
-        "random_state": 0,
-        "sample_posterior": False,
-    })
-
-    # ---- Ridge baseline grid
     ridge_param_grid: Dict[str, List] = field(default_factory=lambda: {
         "regressor__alpha": [1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 1e2, 1e3]
     })
+    SCORING_MODE: str = "rmse"     # "rmse" | "ordinal" | "spearman"
 
-    # ---- Validation scorer for GridSearchCV: "rmse" | "ordinal" | "spearman"
-    SCORING_MODE: str = "ordinal"
-
-    # ---- Ordinal fitting robustness (no binning/coalescing)
-    ORDINAL_LINKS_TRY: List[str] = field(default_factory=lambda: ["logit", "probit", "cloglog"])
+    # ---- Ordinal fitting options (no binning for primary) ----
+    ORDINAL_LINKS_TRY: List[str] = field(default_factory=lambda: ["logit"])
     ORDINAL_OPTIMIZERS_TRY: List[str] = field(default_factory=lambda: ["lbfgs", "bfgs", "newton"])
-    ORDINAL_MAXITER: int = 500
+    ORDINAL_MAXITER: int = 400
     ORDINAL_TOL: float = 1e-6
-    ORDINAL_STANDARDIZE_CHANGE: bool = True   # z-score change before fit?
+    ORDINAL_STANDARDIZE_CHANGE: bool = True
+    ORDINAL_REQUIRE_NON_NAN_PRIMARY: bool = False
 
-    # ---- Diagnostics thresholds
-    ORDINAL_MAX_RAW_CATS_WARN: int = 30
+    # ---- Brant-like proportional-odds diagnostic ----
+    PO_MIN_POS: int = 3
+    PO_MIN_NEG: int = 3
+    PO_ALPHA: float = 0.05
+
+    # ---- PPO sensitivity (disabled by default) ----
+    PPO_SENSITIVITY: bool = False
+    PPO_SENS_MAX_CATS: int = 12
+
+    # ---- Top-k metrics ----
+    HIT_KS: List[int] = field(default_factory=lambda: [1, 5])
+    NDCG_KS: List[int] = field(default_factory=lambda: [5])
+
+    # ---- Uplift re-ranking (NEW) ----
+    UPLIFT_RERANK: bool = False
+    UPLIFT_ALPHA_GRID: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.5, 0.75])
+    UPLIFT_TOPM: Optional[int] = None   # e.g., 20 => re-rank only top-20 by raw preds
+    USE_UPLIFT_FOR_PRIMARY: bool = False 
 
 
 #####################################################################
@@ -144,12 +158,10 @@ def ndcg_at_k_from_rank(rank: int, k: Optional[int] = None) -> float:
     return 1.0 / np.log2(rank + 1.0)
 
 def concordance_index(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y = np.asarray(y_true, float)
-    s = np.asarray(y_pred, float)
+    y = np.asarray(y_true, float); s = np.asarray(y_pred, float)
     mask = np.isfinite(y) & np.isfinite(s)
     y, s = y[mask], s[mask]
-    n = len(y)
-    num = den = 0
+    n = len(y); num = den = 0
     for i in range(n):
         yi, si = y[i], s[i]
         for j in range(i + 1, n):
@@ -175,7 +187,7 @@ def _ohe():
         return OneHotEncoder(handle_unknown="ignore", sparse=True)
 
 def _dedupe(seq):
-    return list(dict.fromkeys(seq))  # preserve order
+    return list(dict.fromkeys(seq))
 
 def _feature_cols_from_pipe(estimator: Pipeline, cfg: "MatchConfig") -> List[str]:
     cols = []
@@ -217,17 +229,14 @@ def _y_eff(y, cfg: "MatchConfig"):
     y = np.asarray(y, float)
     return y if cfg.OUTCOME_HIGHER_IS_BETTER else -y
 
-# Silence the specific sklearn FutureWarning
 warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
+    "ignore", category=FutureWarning,
     message=r"This Pipeline instance is not fitted yet.*"
 )
 
-NEG_LARGE = -1e12  # safe finite fallback score
+NEG_LARGE = -1e12
 
 def _pipeline_is_fitted(pipe: Pipeline) -> bool:
-    """Check fit status without triggering predict()."""
     if not isinstance(pipe, Pipeline):
         return False
     pre = pipe.named_steps.get("preprocessor")
@@ -239,75 +248,108 @@ def _pipeline_is_fitted(pipe: Pipeline) -> bool:
     return pre_ok and reg_ok
 
 
-#####################################################################
-# Robust ordinal LL fit (no binning)
-#####################################################################
-def _fit_ordered_ll_robust(ranks: np.ndarray, y_eff: np.ndarray, cfg: "MatchConfig") -> Dict[str, object]:
-    """
-    Try multiple links & optimizers; optionally z-score y; no binning/coalescing.
-    Returns dict with success flag and details; primary metric is llf if success else NaN.
-    """
-    out = {
-        "success": False, "error": None,
-        "llf": np.nan, "aic": np.nan, "bic": np.nan, "ll_per_case": np.nan,
-        "coef_change": np.nan, "odds_ratio_change": np.nan, "pseudo_r2": np.nan,
-        "link": None, "optimizer": None,
-        "n_cats": int(np.unique(ranks).size)
-    }
-    if not _HAS_SM_ORD:
-        out["error"] = f"statsmodels OrderedModel unavailable: {_SM_ORD_ERR}"
-        return out
+# -------- Uplift helpers --------
+def compute_therapist_pred_baselines(estimator: Pipeline, cfg: MatchConfig,
+                                     df_ref: pd.DataFrame, ther_table: pd.DataFrame) -> Dict[int, float]:
+    """Mean predicted score per therapist over a reference patient set (e.g., validation)."""
+    if len(df_ref) == 0 or len(ther_table) == 0:
+        return {}
+    raw_cols = _feature_cols_from_pipe(estimator, cfg)
+    tid_col = cfg.THERAPIST_ID_COL
+    agg = np.zeros(len(ther_table), dtype=float)
+    for _, prow in df_ref.iterrows():
+        dy = build_dyads_for_patient(cfg, prow, ther_table)
+        dy = _ensure_columns(dy, raw_cols)
+        agg += estimator.predict(dy).astype(float)
+    baseline = agg / max(len(df_ref), 1)
+    return {int(t): float(b) for t, b in zip(ther_table[tid_col].astype(int).to_numpy(), baseline)}
 
+def rerank_with_uplift(preds: np.ndarray, tids: np.ndarray,
+                       baseline_map: Dict[int, float], alpha: float,
+                       topM: Optional[int]) -> np.ndarray:
+    """Return indices ordering therapists by uplift-adjusted score."""
+    base = np.array([baseline_map.get(int(t), 0.0) for t in tids], dtype=float)
+    adj = preds - alpha * base
+    if topM is not None and topM < len(adj):
+        coarse = np.argsort(-preds)[:topM]
+        order = coarse[np.argsort(-adj[coarse])]
+    else:
+        order = np.argsort(-adj)
+    return order
+
+def choose_alpha_for_model(estimator: Pipeline, cfg: MatchConfig,
+                           df_val: pd.DataFrame, y_val: np.ndarray,
+                           ther_table: pd.DataFrame,
+                           baseline_map: Dict[int, float]) -> float:
+    """Pick alpha that maximizes Spearman(-rank, outcome) on validation."""
+    if (not cfg.UPLIFT_RERANK) or len(df_val) == 0 or len(ther_table) == 0 or not baseline_map:
+        return 0.0
+    raw_cols = _feature_cols_from_pipe(estimator, cfg)
+    tid_col = cfg.THERAPIST_ID_COL
+
+    def val_score_for_alpha(alpha: float) -> float:
+        ranks = []
+        yy = _y_eff(y_val, cfg)
+        for _, row in df_val.iterrows():
+            dy = build_dyads_for_patient(cfg, row, ther_table)
+            dy = _ensure_columns(dy, raw_cols)
+            preds = estimator.predict(dy).astype(float)
+            tids  = ther_table[tid_col].astype(int).to_numpy()
+            order = rerank_with_uplift(preds, tids, baseline_map, alpha, cfg.UPLIFT_TOPM)
+            ranked_tids = tids[order]
+            factual = int(row[tid_col])
+            pos = np.where(ranked_tids == factual)[0]
+            ranks.append(int(pos[0]) + 1 if len(pos) else len(ranked_tids) + 1)
+        return _safe_spearman(-np.asarray(ranks, float), yy)
+
+    best_alpha, best_s = 0.0, -np.inf
+    for a in cfg.UPLIFT_ALPHA_GRID:
+        s = val_score_for_alpha(a)
+        if s > best_s:
+            best_alpha, best_s = a, s
+    logger.info("[uplift] selected alpha=%.2f (val Spearman=%.4f)", best_alpha, best_s)
+    return best_alpha
+
+
+#####################################################################
+# Brant-like proportional-odds test
+#####################################################################
+def brant_like_test(ranks: np.ndarray, outcome_eff: np.ndarray, min_pos=3, min_neg=3):
+    """
+    Approximates Brant test by fitting cumulative logits:
+    logit Pr(rank <= c) = α_c + β*y, and testing if β is equal across cutpoints.
+    """
+    if not _HAS_SM:
+        return {"Q": np.nan, "df": 0, "p": np.nan, "per_cut": [], "note": "statsmodels.api unavailable"}
     r = np.asarray(ranks, int)
-    y = np.asarray(y_eff, float)
-    mask = np.isfinite(r) & np.isfinite(y)
-    r, y = r[mask], y[mask]
+    y = np.asarray(outcome_eff, float)
+    cuts = np.sort(np.unique(r))[:-1]  # all but top-most category
 
-    if r.size < 2 or np.unique(r).size < 2:
-        out["error"] = "not enough categories to fit"
-        return out
+    betas, ses, used_cuts = [], [], []
+    for c in cuts:
+        ybin = (r <= c).astype(int)
+        if ybin.sum() < min_pos or (len(ybin) - ybin.sum()) < min_neg:
+            continue
+        X = sm.add_constant(y)
+        try:
+            res = sm.Logit(ybin, X).fit(disp=False, maxiter=200)
+            betas.append(res.params[1])
+            ses.append(res.bse[1])
+            used_cuts.append(int(c))
+        except Exception:
+            continue
 
-    if cfg.ORDINAL_STANDARDIZE_CHANGE:
-        std = np.nanstd(y)
-        if np.isfinite(std) and std > 0:
-            y = (y - np.nanmean(y)) / std
+    k = len(betas)
+    if k < 2:
+        return {"Q": np.nan, "df": 0, "p": np.nan, "per_cut": [], "note": "insufficient cutpoints"}
 
-    err_msgs = []
-    for link in (cfg.ORDINAL_LINKS_TRY or ["logit"]):
-        for method in (cfg.ORDINAL_OPTIMIZERS_TRY or ["lbfgs"]):
-            try:
-                mdl = OrderedModel(pd.Series(r, name="rank"),
-                                   pd.DataFrame({"change": y}),
-                                   distr=link)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    res = mdl.fit(method=method, maxiter=cfg.ORDINAL_MAXITER, tol=cfg.ORDINAL_TOL, disp=False)
-                llf = float(res.llf)
-                aic = float(getattr(res, "aic", np.nan))
-                bic = float(getattr(res, "bic", np.nan))
-                coef = float(res.params.get("change", np.nan))
-                orat = float(np.exp(coef)) if np.isfinite(coef) else np.nan
-                llpc = llf / len(r)
-                # null model for pseudo-R2
-                try:
-                    null = OrderedModel(pd.Series(r, name="rank"),
-                                        pd.DataFrame({"const": np.ones_like(r)}),
-                                        distr=link).fit(method=method, maxiter=cfg.ORDINAL_MAXITER, tol=cfg.ORDINAL_TOL, disp=False)
-                    pr2 = 1.0 - (llf / float(null.llf))
-                except Exception:
-                    pr2 = np.nan
-
-                out.update({
-                    "success": True, "llf": llf, "aic": aic, "bic": bic,
-                    "ll_per_case": llpc, "coef_change": coef, "odds_ratio_change": orat,
-                    "pseudo_r2": pr2, "link": link, "optimizer": method
-                })
-                return out
-            except Exception as e:
-                err_msgs.append(f"{link}/{method}: {e}")
-
-    out["error"] = " | ".join(err_msgs[:3]) + (" ..." if len(err_msgs) > 3 else "")
-    return out
+    w = 1.0 / (np.array(ses) ** 2)
+    beta_bar = np.sum(w * np.array(betas)) / np.sum(w)
+    Q = float(np.sum(w * (np.array(betas) - beta_bar) ** 2))
+    df = k - 1
+    p = float(1.0 - chi2.cdf(Q, df))
+    per_cut = [{"cut": c, "beta": float(b), "se": float(s)} for c, b, s in zip(used_cuts, betas, ses)]
+    return {"Q": Q, "df": df, "p": p, "per_cut": per_cut, "note": None}
 
 
 #####################################################################
@@ -357,8 +399,7 @@ class TorchFMRegressor(BaseEstimator, RegressorMixin):
             self._model.train(); total = 0.0
             for xb, yb in dl:
                 xb, yb = xb.to(self.device), yb.to(self.device)
-                opt.zero_grad()
-                l = crit(self._model(xb), yb); l.backward(); opt.step()
+                opt.zero_grad(); l = crit(self._model(xb), yb); l.backward(); opt.step()
                 total += l.item() * len(xb)
             if self.verbose and (epoch+1) % 5 == 0:
                 print(f"[TorchFM] epoch {epoch+1}/{self.n_epochs}  MSE={total/len(ds):.6f}")
@@ -372,11 +413,9 @@ class TorchFMRegressor(BaseEstimator, RegressorMixin):
             return (self._model(torch.from_numpy(X).to(self.device))
                     .cpu().numpy().ravel())
     def get_params(self, deep=True):
-        return {
-            "k": self.k, "lr": self.lr, "n_epochs": self.n_epochs,
-            "batch_size": self.batch_size, "weight_decay": self.weight_decay,
-            "device": self.device, "random_state": self.random_state, "verbose": self.verbose,
-        }
+        return {"k": self.k, "lr": self.lr, "n_epochs": self.n_epochs,
+                "batch_size": self.batch_size, "weight_decay": self.weight_decay,
+                "device": self.device, "random_state": self.random_state, "verbose": self.verbose}
     def set_params(self, **params):
         for k, v in params.items():
             setattr(self, k, v)
@@ -395,8 +434,7 @@ class RidgeRegressor(BaseEstimator, RegressorMixin):
     def get_params(self, deep=True):
         return {"alpha": self.alpha, "random_state": self.random_state}
     def fit(self, X, y):
-        self._model.fit(X, y)
-        return self
+        self._model.fit(X, y); return self
     def predict(self, X):
         return self._model.predict(X)
 
@@ -410,12 +448,9 @@ def split_leave_last(df: pd.DataFrame, therapist_col: str, date_col: str
     for _, g in df.sort_values(date_col).groupby(therapist_col, sort=False):
         n = len(g)
         if n >= 3:
-            te.append(g.iloc[[-1]])
-            va.append(g.iloc[[-2]])
-            tr.append(g.iloc[:-2])
+            te.append(g.iloc[[-1]]); va.append(g.iloc[[-2]]); tr.append(g.iloc[:-2])
         elif n == 2:
-            te.append(g.iloc[[-1]])
-            tr.append(g.iloc[[0]])
+            te.append(g.iloc[[-1]]); tr.append(g.iloc[[0]])
         else:
             tr.append(g)
     df_train = pd.concat(tr).reset_index(drop=True)
@@ -446,24 +481,16 @@ def make_preprocessor_for_feature_list(
     transformers = []
     if patient_numeric:
         transformers.append(("p_num", Pipeline([
-            ("to_num", to_numeric),
-            ("impute", num_imputer),
-            ("scale", StandardScaler(with_mean=False)),
+            ("to_num", to_numeric), ("impute", num_imputer), ("scale", StandardScaler(with_mean=False)),
         ]), patient_numeric))
     if patient_categorical:
-        transformers.append(("p_cat", Pipeline([
-            ("onehot", _ohe()),
-        ]), patient_categorical))
+        transformers.append(("p_cat", Pipeline([("onehot", _ohe())]), patient_categorical))
     if therapist_numeric:
         transformers.append(("t_num", Pipeline([
-            ("to_num", to_numeric),
-            ("impute", num_imputer),
-            ("scale", StandardScaler(with_mean=False)),
+            ("to_num", to_numeric), ("impute", num_imputer), ("scale", StandardScaler(with_mean=False)),
         ]), therapist_numeric))
     if therapist_categorical:
-        transformers.append(("t_cat", Pipeline([
-            ("onehot", _ohe()),
-        ]), therapist_categorical))
+        transformers.append(("t_cat", Pipeline([("onehot", _ohe())]), therapist_categorical))
 
     return ColumnTransformer(transformers=transformers, remainder="drop", sparse_threshold=0.3)
 
@@ -520,11 +547,23 @@ class OrdinalLLScorer:
                 return NEG_LARGE
             ranks = [predict_rank_for_patient(estimator, self.cfg, row, self.ther)
                      for _, row in X_val.iterrows()]
-            res = _fit_ordered_ll_robust(np.asarray(ranks, int), _y_eff(y_val, self.cfg), self.cfg)
-            if res["success"]:
-                return float(res["llf"])
-            # keep GridSearch stable if ORD fails completely
-            return _safe_spearman(-np.asarray(ranks, float), _y_eff(y_val, self.cfg))
+            ranks = np.asarray(ranks, int)
+            yy = _y_eff(y_val, self.cfg)
+            if ranks.size > 1 and _HAS_SM_ORD:
+                for link in (self.cfg.ORDINAL_LINKS_TRY or ["logit"]):
+                    for method in (self.cfg.ORDINAL_OPTIMIZERS_TRY or ["lbfgs"]):
+                        try:
+                            mdl = OrderedModel(pd.Series(ranks, name="rank"),
+                                               pd.DataFrame({"change": yy}),
+                                               distr=link)
+                            fit_kwargs = dict(method=method, disp=False, maxiter=self.cfg.ORDINAL_MAXITER)
+                            if method != "lbfgs":  # avoid tol warning for lbfgs
+                                fit_kwargs["tol"] = self.cfg.ORDINAL_TOL
+                            res = mdl.fit(**fit_kwargs)
+                            return float(res.llf)
+                        except Exception:
+                            continue
+            return _safe_spearman(-ranks.astype(float), yy)
         except Exception as e:
             logger.debug(f"OrdinalLLScorer error: {e}")
             return NEG_LARGE
@@ -538,7 +577,8 @@ class SpearmanRankScorer:
                 return NEG_LARGE
             ranks = [predict_rank_for_patient(estimator, self.cfg, row, self.ther)
                      for _, row in X_val.iterrows()]
-            return _safe_spearman(-np.asarray(ranks, float), _y_eff(y_val, self.cfg))
+            yy = _y_eff(y_val, self.cfg)
+            return _safe_spearman(-np.asarray(ranks, float), yy)
         except Exception as e:
             logger.debug(f"SpearmanRankScorer error: {e}")
             return NEG_LARGE
@@ -558,46 +598,34 @@ def make_validation_scorer(cfg: MatchConfig, therapists_table: pd.DataFrame):
 
 
 #####################################################################
-# Diagnostics (no binning trials)
+# Top-k & retrieval helpers
 #####################################################################
-def ordinal_fit_diagnostics(ranks: np.ndarray, outcome: np.ndarray, *, cfg: MatchConfig) -> Dict[str, object]:
+def compute_topk_metrics(ranks: np.ndarray, ks_hit: List[int], ks_ndcg: List[int]) -> Dict[str, float]:
     ranks = np.asarray(ranks, int)
-    y = _y_eff(outcome, cfg)
+    out = {}
+    out["mrr"] = float(np.mean(1.0 / ranks)) if len(ranks) else np.nan
+    for k in ks_hit:
+        out[f"hit@{k}"] = float(np.mean(ranks <= k))
+    for k in ks_ndcg:
+        out[f"ndcg@{k}"] = float(np.mean([ndcg_at_k_from_rank(r, k=k) for r in ranks]))
+    return out
 
-    di = {}
-    di["n_test"] = int(len(ranks))
-    di["finite_ranks"] = bool(np.isfinite(ranks).all())
-    di["finite_outcome"] = bool(np.isfinite(y).all())
-    cats, counts = np.unique(ranks, return_counts=True)
-    di["n_categories"] = int(len(cats))
-    di["min_cat_count"] = int(counts.min()) if len(counts) else None
-    di["median_cat_count"] = float(np.median(counts)) if len(counts) else None
-    di["mean_cat_count"] = float(np.mean(counts)) if len(counts) else None
-    di["all_ranks_equal"] = bool(len(cats) <= 1)
-    di["outcome_std"] = float(np.nanstd(y))
-    di["spearman_neg_rank_vs_outcome"] = _safe_spearman(-ranks.astype(float), y)
-    di["kendall_neg_rank_vs_outcome"] = _safe_kendall(-ranks.astype(float), y)
-    di["cindex_neg_rank_vs_outcome"] = float(concordance_index(y, -ranks))
-
-    di["warn_many_categories"] = bool(len(cats) > cfg.ORDINAL_MAX_RAW_CATS_WARN)
-    di["warn_outcome_near_const"] = bool(di["outcome_std"] < 1e-8)
-    di["warn_small_test"] = bool(len(ranks) < 30)
-    di["warn_quasi_separation"] = bool(
-        (abs(di["spearman_neg_rank_vs_outcome"]) > 0.95 if np.isfinite(di["spearman_neg_rank_vs_outcome"]) else False)
-        or (abs(di["kendall_neg_rank_vs_outcome"]) > 0.9 if np.isfinite(di["kendall_neg_rank_vs_outcome"]) else False)
-        or (di["cindex_neg_rank_vs_outcome"] > 0.98)
-    )
-
-    if di["warn_many_categories"]:
-        logger.info("[diagnostics] Many rank categories (%d). ORD may struggle.", di["n_categories"])
-    if di["warn_quasi_separation"]:
-        logger.info("[diagnostics] Near-separation signals (high monotonicity).")
-    if di["warn_outcome_near_const"]:
-        logger.info("[diagnostics] Outcome nearly constant on test fold.")
-    if di["all_ranks_equal"]:
-        logger.info("[diagnostics] All ranks identical — ordinal model not identifiable.")
-
-    return di
+def therapist_topk_table(df_test: pd.DataFrame, ranks: np.ndarray, cfg: MatchConfig) -> pd.DataFrame:
+    r = np.asarray(ranks, int)
+    tids = df_test[cfg.THERAPIST_ID_COL].to_numpy()
+    df = pd.DataFrame({
+        cfg.THERAPIST_ID_COL: tids,
+        "is_top1": (r == 1).astype(int),
+        "is_top5": (r <= 5).astype(int),
+    })
+    agg = df.groupby(cfg.THERAPIST_ID_COL).agg(
+        n_cases=("is_top1", "size"),
+        top1=("is_top1", "sum"),
+        top5=("is_top5", "sum"),
+    ).reset_index()
+    agg["top1_rate"] = agg["top1"] / agg["n_cases"]
+    agg["top5_rate"] = agg["top5"] / agg["n_cases"]
+    return agg.sort_values(["top1", "top5", "n_cases"], ascending=[False, False, False]).reset_index(drop=True)
 
 
 #####################################################################
@@ -613,6 +641,7 @@ class MatchPipeline:
 
     def set_data(self, df: pd.DataFrame) -> None:
         df = df.copy()
+        # Label compute if needed
         if self.cfg.LABEL_COL not in df.columns:
             required = [self.cfg.PHQ8_T0_COL, self.cfg.GAD7_T0_COL,
                         self.cfg.PHQ8_T1_COL, self.cfg.GAD7_T1_COL]
@@ -624,6 +653,7 @@ class MatchPipeline:
                 df[self.cfg.LABEL_COL] = t0_sum - t1_sum
             else:
                 raise ValueError("LABEL_COL missing and PHQ/GAD columns not provided.")
+        # Parse date
         if self.cfg.DATE_COL in df.columns and not pdt.is_datetime64_any_dtype(df[self.cfg.DATE_COL]):
             logger.info("date: parsing '%s' (dayfirst=%s, format=%s)",
                         self.cfg.DATE_COL, self.cfg.DATE_DAYFIRST, self.cfg.DATE_FORMAT)
@@ -666,57 +696,230 @@ class MatchPipeline:
         return Pipeline([("preprocessor", pre), ("regressor", model)])
 
     def _evaluate_on_test(self, name: str, estimator: Pipeline, X_test: pd.DataFrame, y_test: np.ndarray,
-                          df_test: pd.DataFrame, ther_table: pd.DataFrame, val_score: float) -> Dict:
+                          df_test: pd.DataFrame, ther_table: pd.DataFrame, val_score: float,
+                          *, baseline_map: Optional[Dict[int, float]] = None, alpha: float = 0.0) -> Dict:
         yy_test = _y_eff(y_test, self.cfg)
 
-        # observed dyad predictions
-        y_pred_obs = estimator.predict(X_test)
+        # observed dyad predictions for factual pairs (point metrics; unaffected by uplift)
+        y_pred_obs = estimator.predict(X_test).astype(float)
         test_rmse = rmse(y_test, y_pred_obs)
         test_cindex = concordance_index(yy_test, y_pred_obs)
 
-        # ranks & ndcg
-        ranks, ndcgs = [], []
+        # --------- Build rankings per test patient + therapist-level recommendation tallies
+        ranks_uplift = []
+        ranks_raw = []
+        top1_tids = []
+        top5_tids_all = []
+
+        tid_col = self.cfg.THERAPIST_ID_COL
+        raw_cols = _feature_cols_from_pipe(estimator, self.cfg)
+
         for _, row in df_test.iterrows():
-            r = predict_rank_for_patient(estimator, self.cfg, row, ther_table)
-            ranks.append(r); ndcgs.append(ndcg_at_k_from_rank(r))
-        ranks = np.asarray(ranks, int)
-        ndcgs = np.asarray(ndcgs, float)
+            dyads = build_dyads_for_patient(self.cfg, row, ther_table)
+            dyads = _ensure_columns(dyads, raw_cols)
+            preds = estimator.predict(dyads).astype(float)
+            tids  = ther_table[tid_col].astype(int).to_numpy()
 
-        # secondary: Spearman between -rank and outcome (always reported)
-        test_spearman = _safe_spearman(-ranks, yy_test)
+            order_raw = np.argsort(-preds)
+            if self.cfg.UPLIFT_RERANK and alpha > 0.0 and baseline_map:
+                order = rerank_with_uplift(preds, tids, baseline_map, alpha, self.cfg.UPLIFT_TOPM)
+            else:
+                order = order_raw
 
-        # diagnostics (no binning)
-        diagnostics = ordinal_fit_diagnostics(ranks, y_test, cfg=self.cfg)
+            tids_ordered = tids[order]
+            tids_ordered_raw = tids[order_raw]
 
-        # primary: robust ordinal fit (no binning). if it fails, primary is NaN.
-        ord_res = _fit_ordered_ll_robust(ranks, yy_test, self.cfg)
+            # recommendation tallies (uplift order)
+            top1_tids.append(int(tids_ordered[0]))
+            top5_tids_all.extend([int(t) for t in tids_ordered[:5]])
+
+            # ranks for factual therapist
+            factual = int(row[tid_col])
+            pos_u = np.where(tids_ordered == factual)[0]
+            pos_r = np.where(tids_ordered_raw == factual)[0]
+            ranks_uplift.append(int(pos_u[0]) + 1 if len(pos_u) else len(tids_ordered) + 1)
+            ranks_raw.append(int(pos_r[0]) + 1 if len(pos_r) else len(tids_ordered_raw) + 1)
+
+        ranks_uplift = np.asarray(ranks_uplift, int)
+        ranks_raw = np.asarray(ranks_raw, int)
+
+        # therapist-level recommendation counts (uplift order)
+        c_top1 = Counter(top1_tids)
+        c_top5 = Counter(top5_tids_all)
+        ther_ids = ther_table[tid_col].astype(int).tolist()
+        ther_reco_counts = pd.DataFrame({tid_col: ther_ids})
+        ther_reco_counts["top1_count"] = ther_reco_counts[tid_col].map(c_top1).fillna(0).astype(int)
+        ther_reco_counts["top5_count"] = ther_reco_counts[tid_col].map(c_top5).fillna(0).astype(int)
+        n_pat = len(df_test)
+        ther_reco_counts["n_test_patients"] = n_pat
+        ther_reco_counts["top1_share"] = ther_reco_counts["top1_count"] / n_pat
+        ther_reco_counts["top5_share"] = ther_reco_counts["top5_count"] / n_pat
+        ther_reco_counts = ther_reco_counts.sort_values(
+            ["top1_count", "top5_count", tid_col], ascending=[False, False, True]
+        ).reset_index(drop=True)
+
+        # retrieval metrics (patient-level) use uplift order
+        topk = compute_topk_metrics(ranks_uplift, self.cfg.HIT_KS, self.cfg.NDCG_KS)
+
+        # secondary: Spearman (-rank vs outcome) on uplift order
+        test_spearman = _safe_spearman(-ranks_uplift, yy_test)
+
+        # ---- Proportional-odds diagnostic (choose which ranks to test)
+        ranks_for_po = ranks_uplift if self.cfg.USE_UPLIFT_FOR_PRIMARY else ranks_raw
+        po_test = brant_like_test(ranks_for_po, yy_test, min_pos=self.cfg.PO_MIN_POS, min_neg=self.cfg.PO_MIN_NEG)
+        po_p = po_test.get("p", np.nan)
+        po_violation = (np.isfinite(po_p) and (po_p < self.cfg.PO_ALPHA))
+        if po_violation:
+            msg = (f"[PO] Parallel-odds violated (p={po_p:.4g} < α={self.cfg.PO_ALPHA}). "
+                   "Proceeding with ranking metrics (hit@k, ndcg, Spearman) as primary; "
+                   "ordinal LL reported as reference. "
+                   "Set cfg.PPO_SENSITIVITY=True to add MNLogit sensitivity.")
+            logger.warning(msg)
+            try:
+                print(msg)
+            except Exception:
+                pass
+
+        # ---- Primary: Ordinal model (no binning), try multiple links/optimizers
+        coef_change = np.nan; odds_ratio_change = np.nan
+        coef_change_std = np.nan; odds_ratio_change_std = np.nan
+        coef_change_std_flip = np.nan; odds_ratio_change_std_flip = np.nan
+        llf = np.nan; aic = np.nan; bic = np.nan; ll_per_case = np.nan; pseudo_r2 = np.nan
+        used_link = None; used_opt = None
+        primary_detail = {}; sd_used = np.nan
+
+        if _HAS_SM_ORD and len(df_test) > 1:
+            # optionally standardize change for interpretability
+            y_for_fit = yy_test.copy()
+            if self.cfg.ORDINAL_STANDARDIZE_CHANGE:
+                sd = float(np.nanstd(y_for_fit))
+                if sd > 0:
+                    y_for_fit = (y_for_fit - float(np.nanmean(y_for_fit))) / sd
+                    sd_used = sd
+
+            # choose ranks for primary LL
+            use_ranks = ranks_uplift if self.cfg.USE_UPLIFT_FOR_PRIMARY else ranks_raw
+
+            for link in (self.cfg.ORDINAL_LINKS_TRY or ["logit"]):
+                for method in (self.cfg.ORDINAL_OPTIMIZERS_TRY or ["lbfgs"]):
+                    try:
+                        endog = pd.Series(use_ranks, name="rank")
+                        exog  = pd.DataFrame({"change": y_for_fit})
+                        mdl_t = OrderedModel(endog, exog, distr=link)
+                        fit_kwargs = dict(method=method, disp=False, maxiter=self.cfg.ORDINAL_MAXITER)
+                        if method != "lbfgs":  # avoid tol warning for lbfgs
+                            fit_kwargs["tol"] = self.cfg.ORDINAL_TOL
+                        res_t = mdl_t.fit(**fit_kwargs)
+
+                        llf = float(res_t.llf)
+                        aic = float(getattr(res_t, "aic", np.nan))
+                        bic = float(getattr(res_t, "bic", np.nan))
+                        ll_per_case = llf / len(df_test)
+                        c = float(res_t.params.get("change", np.nan))
+                        coef_change_std = c
+                        odds_ratio_change_std = float(np.exp(c)) if np.isfinite(c) else np.nan
+                        # sign-flipped view (better outcome -> better rank)
+                        coef_change_std_flip = -c
+                        odds_ratio_change_std_flip = float(np.exp(-c)) if np.isfinite(c) else np.nan
+
+                        # de-standardize back to raw units if SD used
+                        if np.isfinite(sd_used) and sd_used > 0:
+                            coef_change = c / sd_used
+                            odds_ratio_change = float(np.exp(coef_change)) if np.isfinite(coef_change) else np.nan
+                        else:
+                            coef_change = c
+                            odds_ratio_change = odds_ratio_change_std
+
+                        # pseudo-R2 vs null
+                        try:
+                            null = OrderedModel(endog, pd.DataFrame({"const": np.ones_like(use_ranks)}), distr=link)
+                            res_null = null.fit(**fit_kwargs)
+                            pseudo_r2 = 1.0 - (llf / float(res_null.llf))
+                        except Exception:
+                            pseudo_r2 = np.nan
+
+                        used_link, used_opt = link, method
+                        primary_detail = {"params": res_t.params.to_dict() if hasattr(res_t, "params") else {}}
+                        break
+                    except Exception as e:
+                        primary_detail = {"error": f"{type(e).__name__}: {e}"}
+                if used_link is not None:
+                    break
+
+        # PPO sensitivity (optional)
+        mnlogit_info = {}
+        if _HAS_SM and self.cfg.PPO_SENSITIVITY:
+            try:
+                yX = sm.add_constant(yy_test)
+                mn = sm.MNLogit(ranks_for_po, yX).fit(disp=False, maxiter=300)
+                mnlogit_info = {
+                    "mnlogit_llf": float(mn.llf),
+                    "mnlogit_df_model": int(mn.df_model),
+                    "mnlogit_params_shape": tuple(mn.params.shape),
+                }
+                logger.info("[PPO] MNLogit sensitivity fitted.")
+            except Exception as e:
+                mnlogit_info = {"error": f"{type(e).__name__}: {e}"}
 
         row = {
             "model": name,
             "val_score": val_score,
-            "test_primary_ordinal_ll": float(ord_res["llf"]) if ord_res["success"] else np.nan,
-            "test_coef_change": float(ord_res["coef_change"]) if ord_res["success"] else np.nan,
-            "test_odds_ratio_change": float(ord_res["odds_ratio_change"]) if ord_res["success"] else np.nan,
-            "test_ordinal_ll_per_case": float(ord_res["ll_per_case"]) if ord_res["success"] else np.nan,
-            "test_ordinal_aic": float(ord_res["aic"]) if ord_res["success"] else np.nan,
-            "test_ordinal_bic": float(ord_res["bic"]) if ord_res["success"] else np.nan,
-            "test_ordinal_pseudo_r2": float(ord_res["pseudo_r2"]) if ord_res["success"] else np.nan,
-            "test_ordinal_link": ord_res["link"],
-            "test_ordinal_optimizer": ord_res["optimizer"],
-            "test_ordinal_success": bool(ord_res["success"]),
-            "test_ordinal_error": ord_res["error"] if not ord_res["success"] else None,
+
+            # PRIMARY (LL or NaN)
+            "test_primary_ordinal_ll": llf,
+            "test_ordinal_ll_per_case": ll_per_case,
+            "test_ordinal_aic": aic,
+            "test_ordinal_bic": bic,
+            "test_ordinal_pseudo_r2": pseudo_r2,
+            "test_ordinal_link": used_link,
+            "test_ordinal_optimizer": used_opt,
+
+            # Coefficients / OR (raw & std; plus flipped sign view)
+            "test_coef_change": coef_change,
+            "test_odds_ratio_change": odds_ratio_change,
+            "test_coef_change_std": coef_change_std,
+            "test_odds_ratio_change_std": odds_ratio_change_std,
+            "test_coef_change_std_flip": coef_change_std_flip,
+            "test_odds_ratio_change_std_flip": odds_ratio_change_std_flip,
+            "test_ordinal_sd_change_used": sd_used,
+
+            # Diagnostics
+            "test_ordinal_success": bool(np.isfinite(llf)),
+            "test_ordinal_error": primary_detail.get("error"),
+
+            # Brant-like PO check
+            "po_brant_Q": po_test.get("Q"),
+            "po_brant_df": po_test.get("df"),
+            "po_brant_p": po_p,
+            "po_violation": bool(po_violation),
+
+            # Retrieval (patient-level; uplift order)
+            "test_mrr": topk.get("mrr"),
+            **{f"test_hit@{k}": topk[f"hit@{k}"] for k in self.cfg.HIT_KS},
+            **{f"test_ndcg@{k}": topk[f"ndcg@{k}"] for k in self.cfg.NDCG_KS},
+
+            # Legacy metrics
             "test_spearman": test_spearman,
-            "test_ndcg_mean": float(np.mean(ndcgs)),
-            "test_ndcg_std": float(np.std(ndcgs)),
             "test_rmse": test_rmse,
             "test_cindex": float(test_cindex) if np.isfinite(test_cindex) else np.nan,
             "n_test": int(len(df_test)),
+
+            # Uplift info
+            "uplift_alpha_used": float(alpha),
         }
+
         details = {
-            "ranks": ranks, "ndcgs": ndcgs, "y_test": y_test, "y_pred_obs": y_pred_obs,
-            "c_index": test_cindex, "spearman": test_spearman,
-            "ordinal_result": ord_res,
-            "diagnostics": diagnostics,
+            "ranks_uplift": ranks_uplift,
+            "ranks_raw": ranks_raw,
+            "y_test": y_test,
+            "y_pred_obs": y_pred_obs,
+            "c_index": test_cindex,
+            "spearman": test_spearman,
+            "primary_detail": primary_detail,
+            "po_test": po_test,
+            "ppo_sensitivity": mnlogit_info,
+            "therapist_recommendation_counts": ther_reco_counts,
+            "uplift_alpha_used": float(alpha),
         }
         return {"row": row, "details": details}
 
@@ -759,7 +962,6 @@ class MatchPipeline:
         ridge_gs = GridSearchCV(ridge_pipe, self.cfg.ridge_param_grid, scoring=val_scorer, refit=True, cv=cv, n_jobs=1, verbose=0)
         ridge_gs.fit(X_trval, y_trval)
 
-        # Select best by validation score
         candidates = [
             ("fm", fm_gs.best_estimator_, fm_gs.best_score_, fm_gs),
             ("ridge", ridge_gs.best_estimator_, ridge_gs.best_score_, ridge_gs),
@@ -777,15 +979,33 @@ class MatchPipeline:
         X_test = _ensure_columns(df_test[test_cols].copy(), test_cols)
         y_test = df_test[self.cfg.LABEL_COL].to_numpy()
 
-        # Evaluate BOTH models (best + benchmark)
+        # --- Baselines per therapist from validation (for uplift) ---
+        ther_baseline_pred = {
+            name: compute_therapist_pred_baselines(est, self.cfg, df_val, ther_table)
+            for name, est, _, _ in candidates
+        }
+
+        # --- Choose alpha per model on validation ---
+        alpha_by_model = {
+            name: choose_alpha_for_model(est, self.cfg, df_val, y_val, ther_table, ther_baseline_pred.get(name, {}))
+            for name, est, _, _ in candidates
+        }
+
+        # Evaluate both models (winner + benchmark)
         results_rows = []
         details_by_model = {}
+        therapist_reco_by_model = {}
+
         for name, est, val_score, gs in candidates:
-            eval_out = self._evaluate_on_test(name, est, X_test, y_test, df_test, ther_table, val_score)
+            eval_out = self._evaluate_on_test(
+                name, est, X_test, y_test, df_test, ther_table, val_score,
+                baseline_map=ther_baseline_pred.get(name, {}), alpha=alpha_by_model.get(name, 0.0)
+            )
             results_rows.append(eval_out["row"])
             details_by_model[name] = eval_out["details"]
+            therapist_reco_by_model[name] = eval_out["details"]["therapist_recommendation_counts"]
 
-        # Mark which is best
+        # mark best
         for row in results_rows:
             row["is_best"] = (row["model"] == best_name)
 
@@ -793,6 +1013,9 @@ class MatchPipeline:
 
         self.test_details_ = {
             "models": details_by_model,
+            "therapist_recommendation_counts_by_model": therapist_reco_by_model,
+            "therapist_baselines_by_model": ther_baseline_pred,   
+            "uplift_alpha_by_model": alpha_by_model,             
             "used_features": {
                 "patient_numeric": p_num_u,
                 "patient_categorical": p_cat_u,
@@ -803,8 +1026,8 @@ class MatchPipeline:
             "best_params": dict(candidates[0][3].best_params_) if candidates[0][0]==best_name else dict(candidates[1][3].best_params_)
         }
         ther_table_out = therapists_table_from_train(self.cfg, df_train)
-        return {"summary": summary, "therapists": ther_table_out}
-
+        best_reco = therapist_reco_by_model.get(best_name, pd.DataFrame())
+        return {"summary": summary, "therapists": ther_table_out, "therapist_recommendations": best_reco}
 
 # -----------------------------------------------------------------------------
 # Runner
@@ -812,4 +1035,11 @@ class MatchPipeline:
 def run_pipeline(df: pd.DataFrame, cfg: MatchConfig):
     pipe = MatchPipeline(cfg)
     pipe.set_data(df)
-    return pipe.run()
+    out = pipe.run()
+    # surface internals
+    out["used_features"] = pipe.test_details_.get("used_features", {})
+    out["best_model_name"] = pipe.test_details_.get("best_model_name")
+    out["best_params"] = pipe.test_details_.get("best_params")
+    out["therapist_baselines_by_model"] = pipe.test_details_.get("therapist_baselines_by_model", {})
+    out["uplift_alpha_by_model"] = pipe.test_details_.get("uplift_alpha_by_model", {})
+    return out
