@@ -6,11 +6,12 @@ import sys
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from scipy import sparse
+from scipy.stats import spearmanr, kendalltau
 from collections import Counter
 
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
 from sklearn.model_selection import GridSearchCV, PredefinedSplit
 from sklearn.linear_model import Ridge
@@ -19,38 +20,12 @@ from sklearn.metrics import mean_squared_error
 from sklearn.impute import SimpleImputer
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
+from statsmodels.miscmodels.ordinal_model import OrderedModel
+import statsmodels.api as sm
+from scipy.stats import chi2
 
 from pandas.api import types as pdt
 import warnings
-
-# ----- statsmodels -----
-_HAS_SM_ORD = True
-_SM_ORD_ERR = None
-try:
-    from statsmodels.miscmodels.ordinal_model import OrderedModel
-except Exception as e:
-    _HAS_SM_ORD = False
-    _SM_ORD_ERR = e
-
-_HAS_SM = True
-try:
-    import statsmodels.api as sm
-    from scipy.stats import chi2
-except Exception:
-    _HAS_SM = False
-
-# ----- correlations -----
-try:
-    from scipy.stats import spearmanr, kendalltau
-    _HAS_SPEARMAN = True
-    _HAS_KENDALL = True
-except Exception:
-    try:
-        from scipy.stats import spearmanr
-        _HAS_SPEARMAN = True
-    except Exception:
-        _HAS_SPEARMAN = False
-    _HAS_KENDALL = False
 
 # ----- Torch FM -----
 import torch
@@ -77,9 +52,13 @@ class MatchConfig:
     GAD7_T0_COL: Optional[str] = None
     GAD7_T1_COL: Optional[str] = None
 
-    # Precomputed or computed label (positive = improvement)
-    LABEL_COL: str = "delta_distress"
-    OUTCOME_HIGHER_IS_BETTER: bool = True
+    # Target / outcome behavior
+    TARGET_MODE: str = "t1"          # "delta" or "t1" (used only if LABEL_COL missing and we need to derive)
+    STANDARDIZE_Y: bool = True         # if True, scale y during fit and inverse at predict
+
+    # Name & direction of the target actually used by the model
+    LABEL_COL: str = "t1_distress_sum"
+    OUTCOME_HIGHER_IS_BETTER: bool = False
 
     # ---- Features ----
     patient_numeric: List[str] = field(default_factory=list)
@@ -96,7 +75,7 @@ class MatchConfig:
 
     # ---- Models / HPO ----
     fm_param_grid: Dict[str, List] = field(default_factory=lambda: {
-        "regressor__k": [4,8, 16, 32],
+        "regressor__k": [4, 8, 16, 32],
         "regressor__lr": [1e-3, 5e-4],
         "regressor__n_epochs": [40],
         "regressor__batch_size": [256],
@@ -132,7 +111,7 @@ class MatchConfig:
     UPLIFT_RERANK: bool = False
     UPLIFT_ALPHA_GRID: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.5, 0.75])
     UPLIFT_TOPM: Optional[int] = None   # e.g., 20 => re-rank only top-20 by raw preds
-    USE_UPLIFT_FOR_PRIMARY: bool = False 
+    USE_UPLIFT_FOR_PRIMARY: bool = False
 
 
 #####################################################################
@@ -208,14 +187,10 @@ def _safe_spearman(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, float); b = np.asarray(b, float)
     if a.size < 2 or b.size < 2 or np.all(a == a[0]) or np.all(b == b[0]):
         return 0.0
-    if not _HAS_SPEARMAN:
-        return 0.0
     r = spearmanr(a, b, nan_policy="omit").correlation
     return float(r) if np.isfinite(r) else 0.0
 
 def _safe_kendall(a: np.ndarray, b: np.ndarray) -> float:
-    if not _HAS_KENDALL:
-        return np.nan
     a = np.asarray(a, float); b = np.asarray(b, float)
     if a.size < 2 or b.size < 2:
         return np.nan
@@ -226,6 +201,7 @@ def _safe_kendall(a: np.ndarray, b: np.ndarray) -> float:
         return np.nan
 
 def _y_eff(y, cfg: "MatchConfig"):
+    """Transform the outcome so that 'higher is better' within ranking/ordinal diagnostics."""
     y = np.asarray(y, float)
     return y if cfg.OUTCOME_HIGHER_IS_BETTER else -y
 
@@ -244,7 +220,17 @@ def _pipeline_is_fitted(pipe: Pipeline) -> bool:
     if pre is None or reg is None:
         return False
     pre_ok = hasattr(pre, "transformers_")
-    reg_ok = hasattr(reg, "coef_") or getattr(reg, "_model", None) is not None
+
+    # handle plain estimators, TorchFM, and TransformedTargetRegressor
+    if isinstance(reg, TransformedTargetRegressor):
+        inner = getattr(reg, "regressor_", None) or getattr(reg, "regressor", None)
+        if inner is None:
+            reg_ok = False
+        else:
+            reg_ok = hasattr(inner, "coef_") or getattr(inner, "_model", None) is not None
+    else:
+        reg_ok = hasattr(reg, "coef_") or getattr(reg, "_model", None) is not None
+
     return pre_ok and reg_ok
 
 
@@ -319,8 +305,6 @@ def brant_like_test(ranks: np.ndarray, outcome_eff: np.ndarray, min_pos=3, min_n
     Approximates Brant test by fitting cumulative logits:
     logit Pr(rank <= c) = α_c + β*y, and testing if β is equal across cutpoints.
     """
-    if not _HAS_SM:
-        return {"Q": np.nan, "df": 0, "p": np.nan, "per_cut": [], "note": "statsmodels.api unavailable"}
     r = np.asarray(ranks, int)
     y = np.asarray(outcome_eff, float)
     cuts = np.sort(np.unique(r))[:-1]  # all but top-most category
@@ -549,12 +533,12 @@ class OrdinalLLScorer:
                      for _, row in X_val.iterrows()]
             ranks = np.asarray(ranks, int)
             yy = _y_eff(y_val, self.cfg)
-            if ranks.size > 1 and _HAS_SM_ORD:
+            if ranks.size > 1:
                 for link in (self.cfg.ORDINAL_LINKS_TRY or ["logit"]):
                     for method in (self.cfg.ORDINAL_OPTIMIZERS_TRY or ["lbfgs"]):
                         try:
                             mdl = OrderedModel(pd.Series(ranks, name="rank"),
-                                               pd.DataFrame({"change": yy}),
+                                               pd.DataFrame({self.cfg.LABEL_COL: yy}),
                                                distr=link)
                             fit_kwargs = dict(method=method, disp=False, maxiter=self.cfg.ORDINAL_MAXITER)
                             if method != "lbfgs":  # avoid tol warning for lbfgs
@@ -629,6 +613,16 @@ def therapist_topk_table(df_test: pd.DataFrame, ranks: np.ndarray, cfg: MatchCon
 
 
 #####################################################################
+# Grid helper (param nesting for TTR)
+#####################################################################
+def _maybe_nest_param_grid_for_ttr(grid: Dict[str, List], use_ttr: bool) -> Dict[str, List]:
+    if not use_ttr:
+        return grid
+    # "regressor__*" → "regressor__regressor__*" (because TTR.regressor)
+    return {k.replace("regressor__", "regressor__regressor__"): v for k, v in grid.items()}
+
+
+#####################################################################
 # Main Pipeline
 #####################################################################
 class MatchPipeline:
@@ -650,7 +644,12 @@ class MatchPipeline:
                 df = df.loc[mask_complete].reset_index(drop=True)
                 t0_sum = df[self.cfg.PHQ8_T0_COL].astype(float) + df[self.cfg.GAD7_T0_COL].astype(float)
                 t1_sum = df[self.cfg.PHQ8_T1_COL].astype(float) + df[self.cfg.GAD7_T1_COL].astype(float)
-                df[self.cfg.LABEL_COL] = t0_sum - t1_sum
+                if (self.cfg.TARGET_MODE or "delta").lower() == "t1":
+                    # Predict T1 distress directly
+                    df[self.cfg.LABEL_COL] = t1_sum
+                else:
+                    # Default: delta = T0 - T1 (improvement positive)
+                    df[self.cfg.LABEL_COL] = t0_sum - t1_sum
             else:
                 raise ValueError("LABEL_COL missing and PHQ/GAD columns not provided.")
         # Parse date
@@ -693,7 +692,13 @@ class MatchPipeline:
     def _make_full_pipeline(self, p_num, p_cat, t_num, t_cat, model: BaseEstimator) -> Pipeline:
         logger.info("preprocessor: building (imputer=%s)", getattr(self.cfg, "impute_strategy", "N/A"))
         pre = make_preprocessor_for_feature_list(self.cfg, p_num, p_cat, t_num, t_cat)
-        return Pipeline([("preprocessor", pre), ("regressor", model)])
+
+        reg: BaseEstimator = model
+        if getattr(self.cfg, "STANDARDIZE_Y", False):
+            # Standardize y during fit, auto-inverse on predict ⇒ metrics remain in raw units
+            reg = TransformedTargetRegressor(regressor=model, transformer=StandardScaler())
+
+        return Pipeline([("preprocessor", pre), ("regressor", reg)])
 
     def _evaluate_on_test(self, name: str, estimator: Pipeline, X_test: pd.DataFrame, y_test: np.ndarray,
                           df_test: pd.DataFrame, ther_table: pd.DataFrame, val_score: float,
@@ -788,8 +793,8 @@ class MatchPipeline:
         used_link = None; used_opt = None
         primary_detail = {}; sd_used = np.nan
 
-        if _HAS_SM_ORD and len(df_test) > 1:
-            # optionally standardize change for interpretability
+        if len(df_test) > 1:
+            # optionally standardize outcome for interpretability within the ordinal diagnostic
             y_for_fit = yy_test.copy()
             if self.cfg.ORDINAL_STANDARDIZE_CHANGE:
                 sd = float(np.nanstd(y_for_fit))
@@ -800,11 +805,12 @@ class MatchPipeline:
             # choose ranks for primary LL
             use_ranks = ranks_uplift if self.cfg.USE_UPLIFT_FOR_PRIMARY else ranks_raw
 
+            exog_name = self.cfg.LABEL_COL  # show real target name in the ordinal model
             for link in (self.cfg.ORDINAL_LINKS_TRY or ["logit"]):
                 for method in (self.cfg.ORDINAL_OPTIMIZERS_TRY or ["lbfgs"]):
                     try:
                         endog = pd.Series(use_ranks, name="rank")
-                        exog  = pd.DataFrame({"change": y_for_fit})
+                        exog  = pd.DataFrame({exog_name: y_for_fit})
                         mdl_t = OrderedModel(endog, exog, distr=link)
                         fit_kwargs = dict(method=method, disp=False, maxiter=self.cfg.ORDINAL_MAXITER)
                         if method != "lbfgs":  # avoid tol warning for lbfgs
@@ -815,14 +821,17 @@ class MatchPipeline:
                         aic = float(getattr(res_t, "aic", np.nan))
                         bic = float(getattr(res_t, "bic", np.nan))
                         ll_per_case = llf / len(df_test)
-                        c = float(res_t.params.get("change", np.nan))
+                        c = float(res_t.params.get(exog_name, np.nan))
                         coef_change_std = c
                         odds_ratio_change_std = float(np.exp(c)) if np.isfinite(c) else np.nan
-                        # sign-flipped view (better outcome -> better rank)
+
+                        # Sign-flipped (“pro-good”) view:
+                        # With P(rank<=k) = F(cut_k − β·x) and x set so higher=better (via _y_eff),
+                        # β < 0 means better outcome → better (lower) rank.
                         coef_change_std_flip = -c
                         odds_ratio_change_std_flip = float(np.exp(-c)) if np.isfinite(c) else np.nan
 
-                        # de-standardize back to raw units if SD used
+                        # de-standardize back to raw units if we z-scaled y_for_fit
                         if np.isfinite(sd_used) and sd_used > 0:
                             coef_change = c / sd_used
                             odds_ratio_change = float(np.exp(coef_change)) if np.isfinite(coef_change) else np.nan
@@ -848,7 +857,7 @@ class MatchPipeline:
 
         # PPO sensitivity (optional)
         mnlogit_info = {}
-        if _HAS_SM and self.cfg.PPO_SENSITIVITY:
+        if self.cfg.PPO_SENSITIVITY:
             try:
                 yX = sm.add_constant(yy_test)
                 mn = sm.MNLogit(ranks_for_po, yX).fit(disp=False, maxiter=300)
@@ -957,9 +966,13 @@ class MatchPipeline:
         ridge_pipe = self._make_full_pipeline(p_num_u, p_cat_u, t_num_u, t_cat_u, RidgeRegressor())
         val_scorer = make_validation_scorer(self.cfg, ther_table)
 
-        fm_gs = GridSearchCV(fm_pipe, self.cfg.fm_param_grid, scoring=val_scorer, refit=True, cv=cv, n_jobs=1, verbose=0)
+        use_ttr = bool(getattr(self.cfg, "STANDARDIZE_Y", False))
+        fm_grid    = _maybe_nest_param_grid_for_ttr(self.cfg.fm_param_grid,    use_ttr)
+        ridge_grid = _maybe_nest_param_grid_for_ttr(self.cfg.ridge_param_grid, use_ttr)
+
+        fm_gs = GridSearchCV(fm_pipe, fm_grid, scoring=val_scorer, refit=True, cv=cv, n_jobs=1, verbose=0)
         fm_gs.fit(X_trval, y_trval)
-        ridge_gs = GridSearchCV(ridge_pipe, self.cfg.ridge_param_grid, scoring=val_scorer, refit=True, cv=cv, n_jobs=1, verbose=0)
+        ridge_gs = GridSearchCV(ridge_pipe, ridge_grid, scoring=val_scorer, refit=True, cv=cv, n_jobs=1, verbose=0)
         ridge_gs.fit(X_trval, y_trval)
 
         candidates = [
@@ -1014,8 +1027,8 @@ class MatchPipeline:
         self.test_details_ = {
             "models": details_by_model,
             "therapist_recommendation_counts_by_model": therapist_reco_by_model,
-            "therapist_baselines_by_model": ther_baseline_pred,   
-            "uplift_alpha_by_model": alpha_by_model,             
+            "therapist_baselines_by_model": ther_baseline_pred,
+            "uplift_alpha_by_model": alpha_by_model,
             "used_features": {
                 "patient_numeric": p_num_u,
                 "patient_categorical": p_cat_u,
