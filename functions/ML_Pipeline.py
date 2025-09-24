@@ -33,7 +33,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 # ----- CatBoost -----
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool, EFstrType
 
 #####################################################################
 # Config
@@ -54,13 +54,13 @@ class MatchConfig:
     GAD7_T1_COL: Optional[str] = None
 
     # Target / outcome behavior
-    TARGET_MODE: str = "delta"        # "delta" or "t1" (only used if LABEL_COL must be derived)
+    TARGET_MODE: str = "delta"        # "delta" or "t1"
     STANDARDIZE_Y: bool = True
     AUTO_ORIENT_FROM_TARGET_MODE: bool = True  # auto set HIGHER_IS_BETTER from TARGET_MODE
 
     # Name & direction of the target actually used by the model
     LABEL_COL: str = "t1_distress_sum"
-    OUTCOME_HIGHER_IS_BETTER: bool = False     # will be auto-set for t1/delta when AUTO_ORIENT...=True
+    OUTCOME_HIGHER_IS_BETTER: bool = False     # auto-set for t1/delta when AUTO_ORIENT...=True
 
     # ---- Features ----
     patient_numeric: List[str] = field(default_factory=list)
@@ -92,7 +92,7 @@ class MatchConfig:
         "regressor__learning_rate": [0.03, 0.06],
         "regressor__iterations": [400, 800],
     })
-    SCORING_MODE: str = "rmse"     # keep RMSE for HPO
+    SCORING_MODE: str = "rmse"
 
     # ---- Selection policy ----
     SELECT_BEST_BY: str = "test"  # "validation" | "test"
@@ -109,6 +109,18 @@ class MatchConfig:
 
     # ---- (optional) therapist recommendation tallies ----
     REPORT_TOP_COUNTS: bool = True
+
+    # ---- CatBoost categorical handling ----
+    CAT_USE_NATIVE_CATEGORICAL: bool = False   # True => use native cats; False => OHE
+    CAT_MIN_FREQ_FOR_OHE: int = 1              # min_frequency if using OHE
+
+    # ---- Explanations (configurable) ----
+    EXPLAIN_COMPUTE_FI: bool = True                      # CatBoost split-based feature importance
+    EXPLAIN_COMPUTE_SHAP_GLOBAL: bool = True             # CatBoost SHAP (global, mean |SHAP|)
+    EXPLAIN_COMPUTE_INTERACTIONS: bool = True            # CatBoost interaction importance
+    EXPLAIN_COMPUTE_SHAP_INTERACTIONS: bool = True       # SHAP interaction values (TreeExplainer)
+    EXPLAIN_SAMPLE_ROWS: Optional[int] = None            # sample rows for explanations; None=use all
+    EXPLAIN_TOPK: int = 50                               # top-K rows for *_ohe / *_agg
 
 #####################################################################
 # Logging
@@ -133,9 +145,9 @@ def rmse(y_true, y_pred):
 def _dedupe(seq):
     return list(dict.fromkeys(seq))
 
-def _ohe(sparse_output=True):
+def _ohe(sparse_output=True, min_frequency=1):
     try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=sparse_output)
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=sparse_output, min_frequency=min_frequency)
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=(sparse_output))
 
@@ -148,40 +160,19 @@ def _s_eff(a, cfg: "MatchConfig"):
     return a if cfg.OUTCOME_HIGHER_IS_BETTER else -a
 
 def _pipeline_is_fitted(pipe: Pipeline) -> bool:
-    """
-    Permissive fitted-check that understands TransformedTargetRegressor and CatBoost.
-    Used outside the scorer; the scorer itself now try/excepts prediction directly.
-    """
-    if not isinstance(pipe, Pipeline):
-        return False
-    pre = pipe.named_steps.get("preprocessor")
-    reg = pipe.named_steps.get("regressor")
-    if pre is None or reg is None:
-        return False
+    if not isinstance(pipe, Pipeline): return False
+    pre = pipe.named_steps.get("preprocessor"); reg = pipe.named_steps.get("regressor")
+    if pre is None or reg is None: return False
     pre_ok = hasattr(pre, "transformers_")
-
-    # Unwrap TTR if present
     inner = reg
     if isinstance(reg, TransformedTargetRegressor):
         inner = getattr(reg, "regressor_", None) or getattr(reg, "regressor", None)
-
-    if inner is None:
-        return False
-
-    # CatBoost exposes is_fitted()
+    if inner is None: return False
     if hasattr(inner, "is_fitted"):
-        try:
-            return pre_ok and bool(inner.is_fitted())
-        except Exception:
-            pass
-
-    # Linear-like / Torch-FM signals
-    if hasattr(inner, "coef_") or hasattr(inner, "n_features_in_"):
-        return pre_ok
-    if getattr(inner, "_model", None) is not None:
-        return pre_ok
-
-    # Fallback: presence of predict after fit
+        try: return pre_ok and bool(inner.is_fitted())
+        except Exception: pass
+    if hasattr(inner, "coef_") or hasattr(inner, "n_features_in_"): return pre_ok
+    if getattr(inner, "_model", None) is not None: return pre_ok
     return pre_ok and hasattr(inner, "predict")
 
 def _model_name_from_estimator(estimator: Pipeline) -> str:
@@ -260,11 +251,10 @@ class TorchFMRegressor(BaseEstimator, RegressorMixin):
         opt = optim.Adam(self._model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         crit = nn.MSELoss()
         for epoch in range(self.n_epochs):
-            self._model.train(); total = 0.0
+            self._model.train()
             for xb, yb in dl:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 opt.zero_grad(); l = crit(self._model(xb), yb); l.backward(); opt.step()
-                total += l.item() * len(xb)
         return self
     def predict(self, X):
         if sparse.issparse(X): X = X.todense()
@@ -320,7 +310,6 @@ def make_preprocessor_common(
     t_num: List[str], t_cat: List[str],
     *, force_dense_ohe: bool = False
 ) -> ColumnTransformer:
-    # numeric imputer
     if cfg.impute_strategy == "iterative":
         num_imputer = IterativeImputer(**cfg.iterative_imputer_params)
     elif cfg.impute_strategy == "median":
@@ -336,17 +325,73 @@ def make_preprocessor_common(
             ("to_num", to_numeric), ("impute", num_imputer), ("scale", StandardScaler(with_mean=False)),
         ]), p_num))
     if p_cat:
-        transformers.append(("p_cat", Pipeline([("onehot", _ohe(sparse_output=not force_dense_ohe))]), p_cat))
+        transformers.append(("p_cat", Pipeline([
+            ("onehot", _ohe(sparse_output=not force_dense_ohe, min_frequency=cfg.CAT_MIN_FREQ_FOR_OHE))
+        ]), p_cat))
     if t_num:
         transformers.append(("t_num", Pipeline([
             ("to_num", to_numeric), ("impute", num_imputer), ("scale", StandardScaler(with_mean=False)),
         ]), t_num))
     if t_cat:
-        transformers.append(("t_cat", Pipeline([("onehot", _ohe(sparse_output=not force_dense_ohe))]), t_cat))
+        transformers.append(("t_cat", Pipeline([
+            ("onehot", _ohe(sparse_output=not force_dense_ohe, min_frequency=cfg.CAT_MIN_FREQ_FOR_OHE))
+        ]), t_cat))
 
-    # Force dense for CatBoost (no scipy.sparse)
-    sparse_threshold = 0.0 if force_dense_ohe else 0.3
-    return ColumnTransformer(transformers=transformers, remainder="drop", sparse_threshold=sparse_threshold)
+    ct = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        sparse_threshold=(0.0 if force_dense_ohe else 0.3),
+        verbose_feature_names_out=True,
+    )
+    try:
+        if force_dense_ohe: ct.set_output(transform="pandas")
+        else: ct.set_output(transform="default")
+    except Exception:
+        pass
+    return ct
+
+
+def make_preprocessor_cat_native(
+    cfg: MatchConfig,
+    p_num: List[str], p_cat: List[str],
+    t_num: List[str], t_cat: List[str]
+) -> ColumnTransformer:
+    """Preprocessor for CatBoost *native* categoricals (no OHE)."""
+    if cfg.impute_strategy == "iterative":
+        num_imputer = IterativeImputer(**cfg.iterative_imputer_params)
+    elif cfg.impute_strategy == "median":
+        num_imputer = SimpleImputer(strategy="median")
+    else:
+        raise ValueError(f"Unknown impute_strategy: {cfg.impute_strategy!r}")
+
+    to_numeric = FunctionTransformer(lambda X: pd.DataFrame(X).apply(pd.to_numeric, errors="coerce"))
+    cat_imputer = SimpleImputer(strategy="most_frequent")
+    to_str      = FunctionTransformer(lambda X: pd.DataFrame(X).astype(str))
+
+    transformers = []
+    num_cols = (p_num or []) + (t_num or [])
+    if num_cols:
+        transformers.append(("num", Pipeline([
+            ("to_num", to_numeric), ("impute", num_imputer), ("scale", StandardScaler(with_mean=False)),
+        ]), num_cols))
+    cat_cols = (p_cat or []) + (t_cat or [])
+    if cat_cols:
+        transformers.append(("cat", Pipeline([
+            ("impute", cat_imputer),
+            ("to_str", to_str),  # ensure strings for CatBoost
+        ]), cat_cols))
+
+    ct = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        sparse_threshold=0.0,
+        verbose_feature_names_out=True,
+    )
+    try:
+        ct.set_output(transform="pandas")
+    except Exception:
+        pass
+    return ct
 
 #####################################################################
 # Dyad utils
@@ -368,15 +413,21 @@ def _feature_cols_from_pipe(estimator: Pipeline, cfg: "MatchConfig") -> List[str
     cols = []
     pre = estimator.named_steps.get("preprocessor")
     if pre is not None:
-        for name, trans, sel in getattr(pre, "transformers", []):
-            if name in {"p_num", "p_cat", "t_num", "t_cat"} and isinstance(sel, list):
-                cols.extend(sel)
-    cols = list(dict.fromkeys(cols))
+        try:
+            for name, trans, sel in getattr(pre, "transformers", []):
+                if isinstance(sel, list):
+                    cols.extend(sel)
+            if cols:
+                cols = list(dict.fromkeys(cols))
+        except Exception:
+            cols = []
+    if not cols:
+        cols = list(dict.fromkeys(
+            cfg.patient_numeric + cfg.patient_categorical + cfg.therapist_numeric + cfg.therapist_categorical
+        ))
     ids = []
-    if cfg.PATIENT_ID_COL not in cols:
-        ids.append(cfg.PATIENT_ID_COL)
-    if cfg.THERAPIST_ID_COL not in cols:
-        ids.append(cfg.THERAPIST_ID_COL)
+    if cfg.PATIENT_ID_COL not in cols: ids.append(cfg.PATIENT_ID_COL)
+    if cfg.THERAPIST_ID_COL not in cols: ids.append(cfg.THERAPIST_ID_COL)
     return cols + ids
 
 #####################################################################
@@ -384,10 +435,6 @@ def _feature_cols_from_pipe(estimator: Pipeline, cfg: "MatchConfig") -> List[str
 #####################################################################
 class RMSEScorer:
     def __call__(self, estimator: Pipeline, X_val: pd.DataFrame, y_val: np.ndarray) -> float:
-        """
-        Validation scorer for GridSearchCV.
-        We do NOT pre-check 'fitted' anymore—just try to predict. If anything fails, return NEG_LARGE.
-        """
         try:
             yhat = estimator.predict(X_val)
             return -float(np.sqrt(mean_squared_error(y_val, yhat)))  # higher is better
@@ -406,6 +453,344 @@ def make_validation_scorer(cfg: MatchConfig, therapists_table: pd.DataFrame):
 def _maybe_nest_param_grid_for_ttr(grid: Dict[str, List], use_ttr: bool) -> Dict[str, List]:
     if not use_ttr: return grid
     return {k.replace("regressor__", "regressor__regressor__"): v for k, v in grid.items()}
+
+#####################################################################
+# CatBoost native-wrapper (for native categorical handling)
+#####################################################################
+class CatBoostNativeWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, **cb_params):
+        params = {"loss_function": "RMSE", "random_seed": 42, "verbose": False}
+        params.update(cb_params or {})
+        self.cb_params = params
+        self._model = CatBoostRegressor(**self.cb_params)
+        self.cat_idx_ = None
+
+    def get_params(self, deep=True):
+        return dict(self.cb_params)
+
+    def set_params(self, **params):
+        self.cb_params.update(params or {})
+        self._model = CatBoostRegressor(**self.cb_params)
+        return self
+
+    def _infer_cat_idx(self, X):
+        if isinstance(X, pd.DataFrame):
+            names = list(X.columns)
+            idxs = []
+            for i, (n, dt) in enumerate(zip(names, X.dtypes)):
+                is_cat_dtype = pdt.is_object_dtype(dt) or pdt.is_string_dtype(dt) or pdt.is_categorical_dtype(dt)
+                is_cat_name  = str(n).startswith(("cat__", "p_cat__", "t_cat__"))  # permissive
+                if is_cat_dtype or is_cat_name:
+                    idxs.append(i)
+            return idxs
+        return []
+
+    def _coerce_cats_to_str(self, X):
+        if not isinstance(X, pd.DataFrame) or not self.cat_idx_:
+            return X
+        X = X.copy()
+        cols = list(X.columns)
+        for i in self.cat_idx_:
+            if 0 <= i < len(cols):
+                c = cols[i]
+                if not (pdt.is_object_dtype(X[c]) or pdt.is_integer_dtype(X[c])):
+                    X[c] = X[c].astype(str)
+        return X
+
+    def fit(self, X, y):
+        self.cat_idx_ = self._infer_cat_idx(X)
+        X2 = self._coerce_cats_to_str(X)
+        self._model.fit(X2, y, cat_features=self.cat_idx_ if self.cat_idx_ else None)
+        return self
+
+    def predict(self, X):
+        X2 = self._coerce_cats_to_str(X)
+        return self._model.predict(X2)
+
+    @property
+    def cb_(self):
+        return self._model
+
+#####################################################################
+# Feature name & parent mapping helpers (robust)
+#####################################################################
+def _ct_get_feature_names(pre: ColumnTransformer) -> List[str]:
+    try:
+        return list(pre.get_feature_names_out())
+    except Exception:
+        return []
+
+def _find_ohe_in_transformer(trans):
+    if isinstance(trans, Pipeline):
+        for _, step in trans.named_steps.items():
+            if isinstance(step, OneHotEncoder):
+                return step
+    if isinstance(trans, OneHotEncoder):
+        return trans
+    return None
+
+def _ohe_out_sizes(ohe: OneHotEncoder) -> List[int]:
+    sizes = []
+    drop_idx = getattr(ohe, "drop_idx_", None)
+    for i, cats in enumerate(ohe.categories_):
+        drop_one = 1 if (ohe.drop is not None and drop_idx is not None and drop_idx[i] is not None) else 0
+        sizes.append(len(cats) - drop_one)
+    return sizes
+
+def _parent_mapping_from_pre(pre: ColumnTransformer) -> Dict[str, str]:
+    names = _ct_get_feature_names(pre)
+    mapping: Dict[str, str] = {}
+    out_idx = getattr(pre, "output_indices_", None)
+
+    if out_idx is None:
+        for n in names:
+            s = str(n)
+            if "__" in s: s = s.split("__", 1)[1]
+            if "=" in s: s = s.split("=", 1)[0]
+            mapping[str(n)] = s
+        return mapping
+
+    for name, trans, cols in pre.transformers_:
+        if name not in out_idx:
+            continue
+        sl = out_idx[name]
+        block_names = names[sl] if not isinstance(sl, slice) else names[sl]
+        if isinstance(block_names, np.ndarray):
+            block_names = block_names.tolist()
+        cols = list(cols) if isinstance(cols, (list, tuple)) else list(cols)
+
+        ohe = _find_ohe_in_transformer(trans)
+        if ohe is not None:
+            sizes = _ohe_out_sizes(ohe)
+            pos = 0
+            for i, col in enumerate(cols):
+                cnt = sizes[i]
+                for _ in range(cnt):
+                    if pos < len(block_names):
+                        mapping[block_names[pos]] = col
+                    pos += 1
+        else:
+            for i, col in enumerate(cols):
+                if i < len(block_names):
+                    mapping[block_names[i]] = col
+
+    return mapping
+
+def _unwrap_cat_model_from_pipeline(pipeline: Pipeline):
+    reg = pipeline.named_steps.get("regressor")
+    if isinstance(reg, TransformedTargetRegressor):
+        inner = getattr(reg, "regressor_", None) or getattr(reg, "regressor", None)
+    else:
+        inner = reg
+    if isinstance(inner, CatBoostNativeWrapper):
+        return inner.cb_
+    return inner  # CatBoostRegressor
+
+def _transformed_df_and_names(fitted_pipeline: Pipeline, X_df: pd.DataFrame):
+    pre = fitted_pipeline.named_steps["preprocessor"]
+    X_tx = pre.transform(X_df)
+    names = _ct_get_feature_names(pre)
+    if sparse.issparse(X_tx):
+        X_tx = pd.DataFrame(X_tx.toarray(), columns=names)
+    elif isinstance(X_tx, np.ndarray):
+        X_tx = pd.DataFrame(X_tx, columns=names)
+    elif isinstance(X_tx, pd.DataFrame):
+        if len(names) == X_tx.shape[1] and list(X_tx.columns) != list(names):
+            X_tx = X_tx.copy(); X_tx.columns = names
+    else:
+        X_tx = pd.DataFrame(np.asarray(X_tx), columns=names)
+    return X_tx, names
+
+def _get_cat_features_idx_for_pool(fitted_pipeline: Pipeline, X_tx: pd.DataFrame) -> List[int]:
+    """
+    Return indices of categorical features in the *transformed* DataFrame X_tx,
+    consistent with how the CatBoost model was trained.
+    """
+    reg = fitted_pipeline.named_steps.get("regressor")
+    inner = reg
+    if isinstance(reg, TransformedTargetRegressor):
+        inner = getattr(reg, "regressor_", None) or getattr(reg, "regressor", None)
+
+    # If we trained with native cats, the inner regressor is the wrapper
+    if isinstance(inner, CatBoostNativeWrapper) and getattr(inner, "cat_idx_", None):
+        return list(inner.cat_idx_)
+
+    # OHE path -> everything numeric; return []
+    idxs = []
+    for i, dt in enumerate(X_tx.dtypes):
+        if pdt.is_object_dtype(dt) or pdt.is_string_dtype(dt) or pdt.is_categorical_dtype(dt):
+            idxs.append(i)
+    return idxs
+
+#####################################################################
+# CatBoost explanation utilities (global, SHAP, interactions)
+#####################################################################
+def cat_global_importance_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None, kind="PredictionValuesChange"):
+    model = _unwrap_cat_model_from_pipeline(fitted_pipeline)
+    X_tx, _ = _transformed_df_and_names(fitted_pipeline, X_df)
+    parent = _parent_mapping_from_pre(fitted_pipeline.named_steps["preprocessor"])
+
+    cat_idx = _get_cat_features_idx_for_pool(fitted_pipeline, X_tx)
+    if len(cat_idx):
+        # ensure dtype string for these columns
+        X_tx.iloc[:, cat_idx] = X_tx.iloc[:, cat_idx].astype(str)
+        logger.info("[Explain] Passing %d categorical cols to Pool (FI).", len(cat_idx))
+    pool = Pool(X_tx, label=y, cat_features=cat_idx if len(cat_idx) else None)
+
+    ftype = getattr(EFstrType, kind) if isinstance(kind, str) else kind
+    vals = model.get_feature_importance(pool, type=ftype)
+    df = pd.DataFrame({"feature": list(X_tx.columns), "importance": np.asarray(vals, float)})
+    df["orig_feature"] = df["feature"].map(parent)
+    df_sorted = df.sort_values("importance", ascending=False).reset_index(drop=True)
+
+    agg = (df_sorted.dropna(subset=["orig_feature"])
+           .groupby("orig_feature", as_index=False)["importance"].sum()
+           .sort_values("importance", ascending=False).reset_index(drop=True))
+    return df_sorted, agg
+
+def cat_shap_global_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None):
+    model = _unwrap_cat_model_from_pipeline(fitted_pipeline)
+    X_tx, _ = _transformed_df_and_names(fitted_pipeline, X_df)
+    parent = _parent_mapping_from_pre(fitted_pipeline.named_steps["preprocessor"])
+
+    cat_idx = _get_cat_features_idx_for_pool(fitted_pipeline, X_tx)
+    if len(cat_idx):
+        X_tx.iloc[:, cat_idx] = X_tx.iloc[:, cat_idx].astype(str)
+        logger.info("[Explain] Passing %d categorical cols to Pool (SHAP).", len(cat_idx))
+    pool = Pool(X_tx, label=y, cat_features=cat_idx if len(cat_idx) else None)
+
+    shap_mat = model.get_feature_importance(pool, type=EFstrType.ShapValues)
+    shap_vals = np.asarray(shap_mat)[:, :-1]  # drop expected value col
+
+    per_feat = pd.DataFrame({
+        "feature": list(X_tx.columns),
+        "mean_abs_shap": np.abs(shap_vals).mean(axis=0)
+    })
+    per_feat["orig_feature"] = per_feat["feature"].map(parent)
+    per_feat_sorted = per_feat.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    agg = (per_feat_sorted.dropna(subset=["orig_feature"])
+           .groupby("orig_feature", as_index=False)["mean_abs_shap"].sum()
+           .sort_values("mean_abs_shap", ascending=False)
+           .reset_index(drop=True))
+    return per_feat_sorted, agg, shap_vals
+
+def cat_interactions_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None, top_k=50):
+    """
+    CatBoost built-in pairwise interaction importance (not SHAP interactions).
+    Handles both index- and name-return formats robustly.
+    """
+    model = _unwrap_cat_model_from_pipeline(fitted_pipeline)
+    X_tx, names = _transformed_df_and_names(fitted_pipeline, X_df)
+    parent = _parent_mapping_from_pre(fitted_pipeline.named_steps["preprocessor"])
+    cols = list(X_tx.columns)
+
+    cat_idx = _get_cat_features_idx_for_pool(fitted_pipeline, X_tx)
+    if len(cat_idx):
+        X_tx.iloc[:, cat_idx] = X_tx.iloc[:, cat_idx].astype(str)
+        logger.info("[Explain] Passing %d categorical cols to Pool (Interactions).", len(cat_idx))
+    pool = Pool(X_tx, label=y, cat_features=cat_idx if len(cat_idx) else None)
+
+    pairs = model.get_feature_importance(pool, type=EFstrType.Interaction)
+    arr = np.asarray(pairs, dtype=object)
+
+    if arr.ndim == 2 and arr.shape[1] == 3:
+        df_raw = pd.DataFrame(arr, columns=["a", "b", "score"])
+        ai = pd.to_numeric(df_raw["a"], errors="coerce")
+        aj = pd.to_numeric(df_raw["b"], errors="coerce")
+        if ai.notna().all() and aj.notna().all():
+            df_pairs = pd.DataFrame({
+                "i": ai.astype(int),
+                "j": aj.astype(int),
+                "score": pd.to_numeric(df_raw["score"], errors="coerce"),
+            })
+            m = len(cols)
+            valid = (df_pairs["i"] >= 0) & (df_pairs["i"] < m) & (df_pairs["j"] >= 0) & (df_pairs["j"] < m)
+            df_pairs = df_pairs.loc[valid].copy()
+            df_pairs["feat_i"] = df_pairs["i"].map(lambda k: cols[int(k)])
+            df_pairs["feat_j"] = df_pairs["j"].map(lambda k: cols[int(k)])
+        else:
+            df_pairs = pd.DataFrame({
+                "feat_i": df_raw["a"].astype(str),
+                "feat_j": df_raw["b"].astype(str),
+                "score": pd.to_numeric(df_raw["score"], errors="coerce"),
+            })
+            present = set(cols)
+            df_pairs = df_pairs[df_pairs["feat_i"].isin(present) & df_pairs["feat_j"].isin(present)].copy()
+    else:
+        arr = np.asarray(arr)
+        m = min(arr.shape[0], len(cols))
+        arr = arr[:m, :m]
+        idx_i, idx_j = np.triu_indices(m, k=1)
+        df_pairs = pd.DataFrame({
+            "feat_i": [cols[i] for i in idx_i],
+            "feat_j": [cols[j] for j in idx_j],
+            "score": arr[idx_i, idx_j],
+        })
+
+    df_pairs["orig_i"] = df_pairs["feat_i"].map(parent)
+    df_pairs["orig_j"] = df_pairs["feat_j"].map(parent)
+
+    ohe_top = df_pairs.sort_values("score", ascending=False).head(top_k).reset_index(drop=True)
+
+    df_pairs_agg = df_pairs.dropna(subset=["orig_i","orig_j"]).copy()
+    if len(df_pairs_agg):
+        agg = (df_pairs_agg.assign(pair=list(zip(df_pairs_agg["orig_i"], df_pairs_agg["orig_j"])))
+               .groupby("pair", as_index=False)["score"].sum()
+               .sort_values("score", ascending=False)
+               .head(top_k))
+        agg[["orig_i", "orig_j"]] = pd.DataFrame(agg["pair"].tolist(), index=agg.index)
+        agg = agg.drop(columns=["pair"]).reset_index(drop=True)
+    else:
+        agg = pd.DataFrame(columns=["orig_i","orig_j","score"])
+    return ohe_top, agg
+
+def shap_interactions_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None, top_k=50):
+    """
+    Compute SHAP interaction values (TreeExplainer) if 'shap' is installed.
+    Returns (ohe_top, agg) like the CatBoost interaction function.
+    """
+    try:
+        import shap  # type: ignore
+    except Exception:
+        logger.warning("shap not available; skipping SHAP interaction computation.")
+        return (pd.DataFrame(columns=["feat_i","feat_j","score","orig_i","orig_j"]),
+                pd.DataFrame(columns=["orig_i","orig_j","score"]))
+
+    model = _unwrap_cat_model_from_pipeline(fitted_pipeline)
+    X_tx, _ = _transformed_df_and_names(fitted_pipeline, X_df)
+    parent = _parent_mapping_from_pre(fitted_pipeline.named_steps["preprocessor"])
+
+    explainer = shap.TreeExplainer(model)
+    inter = explainer.shap_interaction_values(X_tx)  # [n, m, m]
+    inter = np.asarray(inter)
+    mean_abs = np.mean(np.abs(inter), axis=0)  # [m, m]
+
+    cols = list(X_tx.columns)
+    m = len(cols)
+    idx_i, idx_j = np.triu_indices(m, k=1)
+    scores = mean_abs[idx_i, idx_j]
+    df_pairs = pd.DataFrame({
+        "feat_i": [cols[i] for i in idx_i],
+        "feat_j": [cols[j] for j in idx_j],
+        "score": scores,
+    }).sort_values("score", ascending=False).reset_index(drop=True)
+
+    df_pairs["orig_i"] = df_pairs["feat_i"].map(parent)
+    df_pairs["orig_j"] = df_pairs["feat_j"].map(parent)
+
+    ohe_top = df_pairs.head(top_k).reset_index(drop=True)
+    df_pairs_agg = df_pairs.dropna(subset=["orig_i","orig_j"]).copy()
+    if len(df_pairs_agg):
+        agg = (df_pairs_agg.assign(pair=list(zip(df_pairs_agg["orig_i"], df_pairs_agg["orig_j"])))
+               .groupby("pair", as_index=False)["score"].sum()
+               .sort_values("score", ascending=False)
+               .head(top_k))
+        agg[["orig_i","orig_j"]] = pd.DataFrame(agg["pair"].tolist(), index=agg.index)
+        agg = agg.drop(columns=["pair"]).reset_index(drop=True)
+    else:
+        agg = pd.DataFrame(columns=["orig_i","orig_j","score"])
+    return ohe_top, agg
 
 #####################################################################
 # Main Pipeline
@@ -488,11 +873,9 @@ class MatchPipeline:
 
     def _evaluate_on_test(self, name: str, estimator: Pipeline, X_test: pd.DataFrame, y_test: np.ndarray,
                           df_test: pd.DataFrame, ther_table: pd.DataFrame, val_score: float) -> Dict:
-        # Factual predictions
         y_pred_obs = estimator.predict(X_test).astype(float)
         test_rmse = rmse(y_test, y_pred_obs)
 
-        # Per-patient factual rank among all therapists, then ordinal regression: rank ~ outcome
         ranks, top1_tids, top5_tids_all = [], [], []
         tid_col = self.cfg.THERAPIST_ID_COL
         raw_cols = _feature_cols_from_pipe(estimator, self.cfg)
@@ -514,7 +897,6 @@ class MatchPipeline:
         ranks = np.asarray(ranks, int)
         yy_test = _y_eff(y_test, self.cfg)
 
-        # Ordinal regression (no binning): rank ~ outcome
         llf = aic = bic = ll_per_case = pseudo_r2 = np.nan
         coef_change = odds_ratio_change = coef_change_std = odds_ratio_change_std = np.nan
         used_link = used_opt = None; sd_used = np.nan
@@ -533,9 +915,7 @@ class MatchPipeline:
                         endog = pd.Series(ranks, name="rank")
                         exog  = pd.DataFrame({exog_name: y_for_fit})
                         mdl_t = OrderedModel(endog, exog, distr=link)
-                        fit_kwargs = dict(method=method, disp=False, maxiter=self.cfg.ORDINAL_MAXITER)
-                        if method != "lbfgs": fit_kwargs["tol"] = self.cfg.ORDINAL_TOL
-                        res_t = mdl_t.fit(**fit_kwargs)
+                        res_t = mdl_t.fit(**{"method": method, "disp": False, "maxiter": self.cfg.ORDINAL_MAXITER})
                         llf = float(res_t.llf)
                         aic = float(getattr(res_t, "aic", np.nan))
                         bic = float(getattr(res_t, "bic", np.nan))
@@ -549,10 +929,9 @@ class MatchPipeline:
                         else:
                             coef_change = c
                             odds_ratio_change = odds_ratio_change_std
-                        # pseudo-R2 vs null
                         try:
                             null = OrderedModel(endog, pd.DataFrame({"const": np.ones_like(ranks)}), distr=link)
-                            res_null = null.fit(**fit_kwargs)
+                            res_null = null.fit(**{"method": method, "disp": False, "maxiter": self.cfg.ORDINAL_MAXITER})
                             pseudo_r2 = 1.0 - (llf / float(res_null.llf))
                         except Exception:
                             pseudo_r2 = np.nan
@@ -563,7 +942,6 @@ class MatchPipeline:
                 if used_link is not None:
                     break
 
-        # Therapist recommendation tallies (optional)
         ther_reco_counts = pd.DataFrame()
         if self.cfg.REPORT_TOP_COUNTS:
             c_top1 = Counter(top1_tids); c_top5 = Counter(top5_tids_all)
@@ -579,7 +957,6 @@ class MatchPipeline:
                 ["top1_count","top5_count",tid_col], ascending=[False, False, True]
             ).reset_index(drop=True)
 
-        # convert negative scorer back to val_rmse; mark failure when scorer returned sentinel/invalid
         val_rmse = -float(val_score) if (np.isfinite(val_score) and (val_score > NEG_LARGE/2)) else np.inf
         val_failed = not np.isfinite(val_score) or (val_score <= NEG_LARGE/2)
 
@@ -637,14 +1014,23 @@ class MatchPipeline:
         test_fold = np.r_[np.full(len(X_train), -1), np.zeros(len(X_val), dtype=int)]
         cv = PredefinedSplit(test_fold)
 
-        # Pipelines (note: CatBoost needs dense; FM/Ridge can handle sparse)
+        # Pipelines
         fm_pipe    = self._make_full_pipeline(p_num_u, p_cat_u, t_num_u, t_cat_u, TorchFMRegressor(), force_dense=False)
         ridge_pipe = self._make_full_pipeline(p_num_u, p_cat_u, t_num_u, t_cat_u, RidgeRegressor(), force_dense=False)
-        cat_pipe   = self._make_full_pipeline(
-            p_num_u, p_cat_u, t_num_u, t_cat_u,
-            CatBoostRegressor(loss_function="RMSE", random_seed=42, verbose=False),
-            force_dense=True
-        )
+
+        if getattr(self.cfg, "CAT_USE_NATIVE_CATEGORICAL", False):
+            pre_cat = make_preprocessor_cat_native(self.cfg, p_num_u, p_cat_u, t_num_u, t_cat_u)
+            cat_model = CatBoostNativeWrapper(loss_function="RMSE", random_seed=42, verbose=False)
+            reg: BaseEstimator = cat_model
+            if getattr(self.cfg, "STANDARDIZE_Y", False):
+                reg = TransformedTargetRegressor(regressor=cat_model, transformer=StandardScaler())
+            cat_pipe  = Pipeline([("preprocessor", pre_cat), ("regressor", reg)])
+        else:
+            cat_pipe  = self._make_full_pipeline(
+                p_num_u, p_cat_u, t_num_u, t_cat_u,
+                CatBoostRegressor(loss_function="RMSE", random_seed=42, verbose=False),
+                force_dense=True
+            )
 
         val_scorer = make_validation_scorer(self.cfg, ther_table)
         use_ttr = bool(getattr(self.cfg, "STANDARDIZE_Y", False))
@@ -659,6 +1045,55 @@ class MatchPipeline:
         fm_gs.fit(X_trval, y_trval)
         ridge_gs.fit(X_trval, y_trval)
         cat_gs.fit(X_trval, y_trval)
+
+        # --- CatBoost explanations (init as empty DFs) ---
+        self.test_details_.update({
+            "cat_importance_ohe": pd.DataFrame(columns=["feature","importance","orig_feature"]),
+            "cat_importance_agg": pd.DataFrame(columns=["orig_feature","importance"]),
+            "cat_shap_ohe": pd.DataFrame(columns=["feature","mean_abs_shap","orig_feature"]),
+            "cat_shap_agg": pd.DataFrame(columns=["orig_feature","mean_abs_shap"]),
+            "cat_interactions_ohe": pd.DataFrame(columns=["feat_i","feat_j","score","orig_i","orig_j"]),
+            "cat_interactions_agg": pd.DataFrame(columns=["orig_i","orig_j","score"]),
+            "shap_interactions_ohe": pd.DataFrame(columns=["feat_i","feat_j","score","orig_i","orig_j"]),
+            "shap_interactions_agg": pd.DataFrame(columns=["orig_i","orig_j","score"]),
+        })
+
+        try:
+            cat_est = cat_gs.best_estimator_
+            # observed dyads only (no IDs); each row = one observed dyad
+            X_imp_full = X_trval[_dedupe(p_num_u + p_cat_u + t_num_u + t_cat_u)].copy()
+            y_imp_full = y_trval
+
+            # sample for explanations (configurable)
+            if isinstance(self.cfg.EXPLAIN_SAMPLE_ROWS, int) and 0 < self.cfg.EXPLAIN_SAMPLE_ROWS < len(X_imp_full):
+                X_imp = X_imp_full.sample(self.cfg.EXPLAIN_SAMPLE_ROWS, random_state=0)
+                y_imp = y_imp_full[X_imp.index]
+                logger.info("Explanations on sampled rows: %d / %d", len(X_imp), len(X_imp_full))
+            else:
+                X_imp, y_imp = X_imp_full, y_imp_full
+
+            if self.cfg.EXPLAIN_COMPUTE_FI:
+                fi_ohe, fi_agg = cat_global_importance_df(cat_est, X_imp, y_imp, kind="PredictionValuesChange")
+                self.test_details_["cat_importance_ohe"] = fi_ohe.head(self.cfg.EXPLAIN_TOPK)
+                self.test_details_["cat_importance_agg"] = fi_agg.head(self.cfg.EXPLAIN_TOPK)
+
+            if self.cfg.EXPLAIN_COMPUTE_SHAP_GLOBAL:
+                shap_ohe, shap_agg, _ = cat_shap_global_df(cat_est, X_imp, y_imp)
+                self.test_details_["cat_shap_ohe"] = shap_ohe.head(self.cfg.EXPLAIN_TOPK)
+                self.test_details_["cat_shap_agg"] = shap_agg.head(self.cfg.EXPLAIN_TOPK)
+
+            if self.cfg.EXPLAIN_COMPUTE_INTERACTIONS:
+                ints_ohe, ints_agg = cat_interactions_df(cat_est, X_imp, y_imp, top_k=self.cfg.EXPLAIN_TOPK)
+                self.test_details_["cat_interactions_ohe"] = ints_ohe
+                self.test_details_["cat_interactions_agg"] = ints_agg
+
+            if self.cfg.EXPLAIN_COMPUTE_SHAP_INTERACTIONS:
+                sints_ohe, sints_agg = shap_interactions_df(cat_est, X_imp, y_imp, top_k=self.cfg.EXPLAIN_TOPK)
+                self.test_details_["shap_interactions_ohe"] = sints_ohe
+                self.test_details_["shap_interactions_agg"] = sints_agg
+
+        except Exception as e:
+            print(f"[CatBoost explanations] {type(e).__name__}: {e}")
 
         # Collect candidates
         candidates = [
@@ -698,14 +1133,14 @@ class MatchPipeline:
         best_model, _, best_gs = cand_map[best_name][0], cand_map[best_name][1], cand_map[best_name][2]
         logger.info("[Selected] %s | policy=%s", best_name, self.cfg.SELECT_BEST_BY)
 
-        # Sort summary (valid val first, then val_rmse, then test_rmse)
+        # Sort summary
         df_sum["val_rmse_sort"] = df_sum["val_rmse"].replace(np.inf, np.nan)
         df_sum = df_sum.sort_values(
             by=["val_failed", "val_rmse_sort", "test_rmse"],
             ascending=[True, True, True]
         ).drop(columns=["val_rmse_sort"]).reset_index(drop=True)
 
-        # Example: scores for the first test patient (best model)
+        # Example scores for first test patient
         example_scores = pd.DataFrame()
         if len(df_test) > 0:
             try:
@@ -719,6 +1154,7 @@ class MatchPipeline:
                 print(f"[Example scores] {type(e).__name__}: {e}")
 
         self.test_details_ = {
+            **self.test_details_,
             "models": details_by_model,
             "therapist_recommendation_counts_by_model": therapist_reco_by_model,
             "used_features": {
@@ -744,4 +1180,25 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig):
     out["best_model_name"] = pipe.test_details_.get("best_model_name")
     out["best_params"] = pipe.test_details_.get("best_params")
     out["example_scores_first_test_patient"] = pipe.test_details_.get("example_scores_first_test_patient", pd.DataFrame())
+
+    # keep outputs as DataFrames
+    def _df_or_empty(df_obj, cols):
+        return df_obj if isinstance(df_obj, pd.DataFrame) else pd.DataFrame(columns=cols)
+
+    out["cat_importance_ohe"] = _df_or_empty(pipe.test_details_.get("cat_importance_ohe"),
+                                             ["feature","importance","orig_feature"])
+    out["cat_importance_agg"] = _df_or_empty(pipe.test_details_.get("cat_importance_agg"),
+                                             ["orig_feature","importance"])
+    out["cat_shap_ohe"] = _df_or_empty(pipe.test_details_.get("cat_shap_ohe"),
+                                       ["feature","mean_abs_shap","orig_feature"])
+    out["cat_shap_agg"] = _df_or_empty(pipe.test_details_.get("cat_shap_agg"),
+                                       ["orig_feature","mean_abs_shap"])
+    out["cat_interactions_ohe"] = _df_or_empty(pipe.test_details_.get("cat_interactions_ohe"),
+                                               ["feat_i","feat_j","score","orig_i","orig_j"])
+    out["cat_interactions_agg"] = _df_or_empty(pipe.test_details_.get("cat_interactions_agg"),
+                                               ["orig_i","orig_j","score"])
+    out["shap_interactions_ohe"] = _df_or_empty(pipe.test_details_.get("shap_interactions_ohe"),
+                                               ["feat_i","feat_j","score","orig_i","orig_j"])
+    out["shap_interactions_agg"] = _df_or_empty(pipe.test_details_.get("shap_interactions_agg"),
+                                               ["orig_i","orig_j","score"])
     return out
