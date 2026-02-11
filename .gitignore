@@ -95,6 +95,7 @@ artifacts/
 *.npz
 *.parquet
 *.feather
+*.docx
 
 # Keep a placeholder readme if you want the folder visible in git
 !model_outputs/README.md
