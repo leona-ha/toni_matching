@@ -1,0 +1,2 @@
+model,formula,icc_point,sigma2_therapist,sigma2_resid,n,n_therapists,icc_mean_boot,icc_ci_low,icc_ci_high,n_boot_ok,B,message,boot_message
+baseline_adjusted,t1_distress_sum ~ t0_distress_sum,0.0,0.0,33.355843355647345,942,159,0.0023010981959177635,0.0,0.025747869752759788,2000,2000,ok,ok

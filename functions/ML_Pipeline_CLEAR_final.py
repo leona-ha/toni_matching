@@ -5,14 +5,14 @@ import sys
 import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from collections import Counter
 from scipy.stats import norm
-
+import hashlib
 
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.pipeline import Pipeline
@@ -25,7 +25,6 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
-from typing import Any, Dict, List, Union
 
 import statsmodels.api as sm
 from pandas.api import types as pdt
@@ -81,6 +80,8 @@ class MatchConfig:
     # ---- Benchmarks ----
     INCLUDE_NAIVE_MEAN_BASELINE: bool = True
     INCLUDE_PATIENT_ONLY_BENCHMARK: bool = True
+    # Patient-only benchmark ARCH is now FIXED to CatBoost
+    PATIENT_ONLY_BENCHMARK_ARCH: str = "cat"
 
     # ---- Imputation ----
     impute_strategy: str = "median"   # "median" | "iterative" | "mean"
@@ -94,7 +95,6 @@ class MatchConfig:
     })
 
     # ---- Caching ----
-    # Not necessary by default; can be turned on for experimentation.
     CACHE_STEPS: bool = False
     CACHE_DIR: str = field(default_factory=lambda: os.environ.get("SKCACHE_DIR", "./.sk_cache"))
 
@@ -138,15 +138,12 @@ class MatchConfig:
         "regressor__random_state": [42],
     })
 
-    # ---- Selection policy ----
-    SELECT_BEST_BY: str = "test"  # fixed as requested
-
     # ---- (optional) therapist recommendation tallies ----
     REPORT_TOP_COUNTS: bool = True
 
     # ---- CatBoost categorical handling ----
     CAT_USE_NATIVE_CATEGORICAL: bool = True   # True => native cats; False => OHE
-    CAT_MIN_FREQ_FOR_OHE: int = 1              # min_frequency if using OHE
+    CAT_MIN_FREQ_FOR_OHE: int = 1
     CAT_NATIVE_HANDLE_MISSING: bool = False
 
     # ---- Explanations ----
@@ -161,8 +158,6 @@ class MatchConfig:
     DROP_ZERO_VARIANCE_FEATURES: bool = True
     ZERO_VAR_COUNT_NAN_AS_VALUE: bool = False
 
-
-
     # ---- RMSE CI options (bootstrap only; delta removed) ----
     RMSE_CI_ENABLE: bool = True
     RMSE_CI_LEVEL: float = 0.95
@@ -170,26 +165,21 @@ class MatchConfig:
     RMSE_CI_RANDOM_STATE: int = 0
 
     # ---- Cross-validation / repeat strategy ----
-    # "leave_last"                 : time-ordered per therapist (train/val/test as implemented)
-    # "per_therapist_random"       : random per-therapist train/val/test; supports outer repeats via CV_N_REPEATS
-    # "outer_leave_last_inner_repeated": outer leave-last TEST (time-ordered), inner repeated per-therapist random holdout for HPO
-    # "kfold"
     CV_STRATEGY: str = "per_therapist_random"
-    CV_N_REPEATS: int = 5          # only used when CV_STRATEGY == "per_therapist_random" (outer repeats)
-    CV_RANDOM_STATE: int = 42
+    CV_N_REPEATS: int = 5
+    CV_RANDOM_STATE: int = 123 #35
 
     # ---- Inner tuning CV (only used when CV_STRATEGY == "outer_leave_last_inner_repeated") ----
     INNER_N_REPEATS: int = 5
     INNER_RANDOM_STATE: int = 123
-    INNER_VAL_PER_THERAPIST: int = 1          # how many cases per therapist go to inner validation in each repeat
-    INNER_MIN_N_FOR_VAL: int = 1              # therapists with < this many cases contribute no inner-val cases
-    INNER_FALLBACK_GLOBAL_VAL_FRAC: float = 0.10  # used only if an inner split ends up with empty val
+    INNER_VAL_PER_THERAPIST: int = 1
+    INNER_MIN_N_FOR_VAL: int = 1
+    INNER_FALLBACK_GLOBAL_VAL_FRAC: float = 0.10
 
     # ---- KFold (row-wise) outer evaluation ----
     KFOLD_N_SPLITS: int = 5
     KFOLD_SHUFFLE: bool = False
-    KFOLD_VAL_FRAC: float = 0.0   # fraction of the fold-train set used as "val" for PredefinedSplit HPO
-
+    KFOLD_VAL_FRAC: float = 0.0
 
 
 #####################################################################
@@ -208,6 +198,7 @@ logger = logging.getLogger("Match_Pipeline")
 warnings.filterwarnings("ignore", category=FutureWarning, message=r"This Pipeline instance is not fitted yet.*")
 NEG_LARGE = -1e12
 
+
 def _drop_zero_variance_feature_lists(
     df_ref: pd.DataFrame,
     *,
@@ -215,12 +206,6 @@ def _drop_zero_variance_feature_lists(
     t_num: List[str], t_cat: List[str],
     count_nan_as_value: bool = False,
 ) -> Tuple[List[str], List[str], List[str], List[str], Dict[str, str]]:
-    """
-    Drops features that have <=1 unique value in df_ref (training only).
-    Applies to patient + therapist features.
-    - If count_nan_as_value=False: ignore NaNs for uniqueness; all-NaN => drop.
-    Returns filtered lists and a dict {feature: reason}.
-    """
     dropped: Dict[str, str] = {}
 
     def nunique_series(s: pd.Series) -> int:
@@ -249,7 +234,6 @@ def _drop_zero_variance_feature_lists(
     return p_num_out, p_cat_out, t_num_out, t_cat_out, dropped
 
 
-
 def _now_berlin(cfg: MatchConfig) -> datetime:
     if ZoneInfo is not None:
         try:
@@ -258,6 +242,7 @@ def _now_berlin(cfg: MatchConfig) -> datetime:
             pass
     return datetime.now()
 
+
 def _make_run_dir(cfg: MatchConfig) -> Path:
     base = Path(cfg.OUTPUT_BASE_DIR)
     base.mkdir(parents=True, exist_ok=True)
@@ -265,7 +250,6 @@ def _make_run_dir(cfg: MatchConfig) -> Path:
     stamp = _now_berlin(cfg).strftime(cfg.OUTPUT_TIMESTAMP_FMT)
     run_dir = base / f"run_{stamp}"
 
-    # avoid collisions (hour-level timestamp can collide)
     if run_dir.exists():
         k = 2
         while True:
@@ -280,12 +264,6 @@ def _make_run_dir(cfg: MatchConfig) -> Path:
 
 
 def _init_run_context(cfg: MatchConfig, *, repeat_index: Optional[int] = None) -> Path:
-    """
-    Ensures cfg.OUTPUT_RUN_DIR is set and returns:
-      - base run_dir if repeat_index is None
-      - run_dir/repeat_XX if repeat_index is provided
-    Also scopes cache under the same folder when CACHE_STEPS=True.
-    """
     base = Path(cfg.OUTPUT_RUN_DIR) if cfg.OUTPUT_RUN_DIR else _make_run_dir(cfg)
     cfg.OUTPUT_RUN_DIR = str(base)
 
@@ -296,7 +274,6 @@ def _init_run_context(cfg: MatchConfig, *, repeat_index: Optional[int] = None) -
         out_dir.mkdir(parents=True, exist_ok=True)
 
     if getattr(cfg, "CACHE_STEPS", False):
-        # isolate cache per (repeat) run to avoid cross-run contamination
         cfg.CACHE_DIR = str(out_dir / "sk_cache")
         Path(cfg.CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -307,8 +284,8 @@ def _ensure_dir(p: str) -> str:
     Path(p).mkdir(parents=True, exist_ok=True)
     return p
 
+
 def _json_sanitize(obj):
-    # convert numpy types to python scalars for json
     if isinstance(obj, (np.integer, np.int64, np.int32)):
         return int(obj)
     if isinstance(obj, (np.floating, np.float64, np.float32)):
@@ -317,22 +294,20 @@ def _json_sanitize(obj):
         return obj.tolist()
     return obj
 
+
 def _save_json(path: str, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=_json_sanitize)
+
 
 def _save_df(df: pd.DataFrame, path: str) -> None:
     if df is None or not isinstance(df, pd.DataFrame):
         return
     if not len(df):
-        # still write an empty file with headers for reproducibility
         df.to_csv(path, index=False)
         return
     df.to_csv(path, index=False)
 
-def _save_npz(path: str, **arrays) -> None:
-    # arrays can include lists; numpy will store them (object) if needed
-    np.savez_compressed(path, **arrays)
 
 def _save_outputs_bundle(out_dir: str, out: Dict[str, object]) -> None:
     """
@@ -347,6 +322,11 @@ def _save_outputs_bundle(out_dir: str, out: Dict[str, object]) -> None:
     # core tables
     if isinstance(out.get("summary"), pd.DataFrame):
         _save_df(out["summary"], os.path.join(tables_dir, "summary.csv"))
+
+    # NEW: if repeated runs, keep last-run summary too
+    if isinstance(out.get("summary_last_run"), pd.DataFrame):
+        _save_df(out["summary_last_run"], os.path.join(tables_dir, "summary_last_run.csv"))
+
     if isinstance(out.get("therapists"), pd.DataFrame):
         _save_df(out["therapists"], os.path.join(tables_dir, "therapists.csv"))
     if isinstance(out.get("therapist_recommendations"), pd.DataFrame):
@@ -370,6 +350,7 @@ def _save_outputs_bundle(out_dir: str, out: Dict[str, object]) -> None:
     for key, fname in [
         ("cv_runs_summary", "cv_runs_summary.csv"),
         ("cv_best_policy_summary", "cv_best_policy_summary.csv"),
+        ("cv_selected_model_counts", "cv_selected_model_counts.csv"),
         ("cv_rmse_stats_per_model", "cv_rmse_stats_per_model.csv"),
         ("cv_rmse_stats_best", "cv_rmse_stats_best.csv"),
         ("cv_cat_importance_mean", "cv_cat_importance_mean.csv"),
@@ -382,18 +363,27 @@ def _save_outputs_bundle(out_dir: str, out: Dict[str, object]) -> None:
         ("cv_posthoc_pooled_clustered_ols", "cv_posthoc_pooled_clustered_ols.csv"),
         ("cv_posthoc_mixedlm", "cv_posthoc_mixedlm.csv"),
         ("cv_posthoc_beta_distribution", "cv_posthoc_beta_distribution.csv"),
-
     ]:
         if isinstance(out.get(key), pd.DataFrame):
             _save_df(out[key], os.path.join(tables_dir, fname))
 
-    # metadata
+    # metadata (expanded; includes seeds + cat settings)
     meta = {
         "output_dir": out.get("output_dir"),
+        "repeat_index": out.get("repeat_index", None),
+        "split_seed": out.get("split_seed", None),
+        "seeds_by_run": out.get("seeds_by_run", None),
+
+        "cv_strategy": out.get("cv_strategy", None),
+        "cv_random_state": out.get("cv_random_state", None),
+        "cv_n_repeats": out.get("cv_n_repeats", None),
+
+        "cat_use_native_categorical": out.get("cat_use_native_categorical", None),
+        "cat_native_handle_missing": out.get("cat_native_handle_missing", None),
+
         "best_model_name": out.get("best_model_name"),
         "best_params": out.get("best_params"),
         "used_features": out.get("used_features"),
-        "cv_n_repeats": out.get("cv_n_repeats"),
         "run_models": out.get("run_models"),
     }
     _save_json(os.path.join(meta_dir, "run_meta.json"), meta)
@@ -445,7 +435,6 @@ def _ohe(sparse_output=True, min_frequency=1):
 
 
 def _s_eff(scores: np.ndarray, cfg: MatchConfig) -> np.ndarray:
-    """Convert predictions to 'higher is better' scores for sorting."""
     scores = np.asarray(scores, float)
     return scores if cfg.OUTCOME_HIGHER_IS_BETTER else -scores
 
@@ -458,12 +447,12 @@ def _model_name_from_estimator(estimator: Pipeline) -> str:
     return type(reg).__name__ if reg is not None else type(estimator).__name__
 
 
-# Treat already-binary dummy columns as numeric in the native-cat pipeline
 _DUMMY_PREFIXES = (
     "t0_method_t_", "t0_appliedmethod_t_", "t0_disease_p_",
     "t0_therapy_p_", "t0_migration_p_",
 )
 _DUMMY_EXACT = {"t0_familyhistory_p", "t0_meds_p"}
+
 
 def _is_preencoded_dummy(col: str) -> bool:
     return (col in _DUMMY_EXACT) or any(str(col).startswith(p) for p in _DUMMY_PREFIXES)
@@ -487,14 +476,10 @@ def _to_str_df(X):
         return X.astype(str)
     return pd.DataFrame(X).astype(str)
 
+
 def _to_str_preserve_nan_df(X):
-    """
-    Convert values to strings but KEEP missing values as NaN (do NOT turn NaN into 'nan').
-    CatBoost then handles missing categoricals natively.
-    """
     if sparse.issparse(X):
         X = X.toarray()
-
     if not isinstance(X, pd.DataFrame):
         X = pd.DataFrame(X)
 
@@ -503,30 +488,20 @@ def _to_str_preserve_nan_df(X):
         s = X[c]
         mask = s.isna()
         s2 = s.astype("object")
-
-        # convert only non-missing to str
         s2.loc[~mask] = s2.loc[~mask].map(lambda v: str(v))
-
-        # enforce actual NaN for missing
         s2.loc[mask] = np.nan
         X[c] = s2
-
     return X
 
 
 def _to_float_preserve_nan_df(X):
-    """
-    Coerce to float, preserve NaN, and replace +/-inf with NaN.
-    """
     if sparse.issparse(X):
         X = X.toarray()
     if not isinstance(X, pd.DataFrame):
         X = pd.DataFrame(X)
-
     Xn = X.apply(pd.to_numeric, errors="coerce").astype(float)
     Xn = Xn.replace([np.inf, -np.inf], np.nan)
     return Xn
-
 
 
 def _FT(func):
@@ -659,7 +634,6 @@ class RidgeRegressor(BaseEstimator, RegressorMixin):
 #####################################################################
 # Split
 #####################################################################
-
 def split_kfold(
     df: pd.DataFrame,
     *,
@@ -669,16 +643,15 @@ def split_kfold(
     repeat_index: int,
     val_frac: float = 0.10,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Row-wise KFold outer split (like standard ML papers):
-      - TEST: one fold
-      - TRAIN/VAL: remaining folds, with VAL sampled globally from TRAIN according to val_frac
-    """
     n_splits = int(n_splits)
     if n_splits < 2:
         raise ValueError("KFOLD_N_SPLITS must be >= 2.")
 
-    kf = KFold(n_splits=n_splits, shuffle=bool(shuffle), random_state=int(random_state))
+    kf = KFold(
+        n_splits=n_splits,
+        shuffle=bool(shuffle),
+        random_state=(int(random_state) if shuffle else None),
+    )
     splits = list(kf.split(df))
     fold = int(repeat_index) % n_splits
     train_idx, test_idx = splits[fold]
@@ -686,7 +659,6 @@ def split_kfold(
     df_test = df.iloc[test_idx].copy().reset_index(drop=True)
     df_trainval = df.iloc[train_idx].copy().reset_index(drop=True)
 
-    # Global val sampled from fold-train
     df_val = df.iloc[0:0].copy()
     df_train = df_trainval
 
@@ -694,7 +666,7 @@ def split_kfold(
     if val_frac and n_tv >= 3:
         n_val = int(round(float(val_frac) * n_tv))
         n_val = max(1, n_val)
-        n_val = min(n_val, n_tv - 1)  # keep at least 1 in train
+        n_val = min(n_val, n_tv - 1)
 
         rs = np.random.RandomState(int(random_state) + 10_000 + fold)
         val_idx = rs.choice(np.arange(n_tv), size=n_val, replace=False)
@@ -723,17 +695,12 @@ def split_leave_last(df: pd.DataFrame, therapist_col: str, date_col: str) -> Tup
     df_test = pd.concat(te).reset_index(drop=True) if te else df.iloc[0:0].copy()
     return df_train, df_val, df_test
 
+
 def split_leave_last_test_only(
     df: pd.DataFrame,
     therapist_col: str,
     date_col: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Outer split for prospective evaluation:
-      - TEST: last patient per therapist (time-ordered)
-      - TRAIN: all earlier patients
-      - VAL: empty (inner CV handles tuning)
-    """
     tr, te = [], []
     df_sorted = df.sort_values(date_col)
     for _, g in df_sorted.groupby(therapist_col, sort=False):
@@ -745,14 +712,15 @@ def split_leave_last_test_only(
             tr.append(g)
 
     df_train = pd.concat(tr).reset_index(drop=True) if tr else df.iloc[0:0].copy()
-    df_val = df.iloc[0:0].copy()  # intentionally empty
+    df_val = df.iloc[0:0].copy()
     df_test = pd.concat(te).reset_index(drop=True) if te else df.iloc[0:0].copy()
     return df_train, df_val, df_test
 
 
 def _seed_for_tid(tid, base_seed: int, repeat_index: int) -> int:
-    h = hash((str(tid), int(base_seed), int(repeat_index)))
-    return int(np.abs(h) % (2**32 - 1) or 1)
+    s = f"{tid}|{base_seed}|{repeat_index}".encode("utf-8")
+    h = hashlib.md5(s).hexdigest()
+    return int(h[:8], 16) or 1
 
 
 def split_per_therapist_random(
@@ -762,12 +730,6 @@ def split_per_therapist_random(
     base_seed: int = 0,
     repeat_index: int = 0
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    For each therapist:
-      - n >= 3: pick 1 random row for TEST and 1 random row for VAL (distinct); rest TRAIN
-      - n == 2: pick 1 for TEST; other goes TRAIN (no VAL for that therapist)
-      - n == 1: all TRAIN
-    """
     tr, va, te = [], [], []
     for tid, g in df.groupby(therapist_col, sort=False):
         g = g.sample(frac=1.0, random_state=_seed_for_tid(tid, base_seed, repeat_index)).reset_index(drop=True)
@@ -821,16 +783,7 @@ def split_dataset(df: pd.DataFrame, cfg: MatchConfig, *, repeat_index: int = 0) 
     return split_leave_last(df, cfg.THERAPIST_ID_COL, cfg.DATE_COL)
 
 
-
 class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
-    """
-    Inner tuning CV:
-      - Repeats R times
-      - In each repeat, for each therapist with >= min_n_for_val cases:
-            randomly assign val_per_therapist cases to validation, rest to training
-        Therapists with fewer cases contribute only to training.
-      - If validation ends up empty, fall back to a small global validation split.
-    """
     def __init__(
         self,
         *,
@@ -852,7 +805,6 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
         return self.n_repeats
 
     def split(self, X, y=None, groups=None):
-        # Prefer explicit groups; else fall back to X[therapist_col] if available
         if groups is None:
             if isinstance(X, pd.DataFrame) and (self.therapist_col in X.columns):
                 groups = X[self.therapist_col].to_numpy()
@@ -863,7 +815,6 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
         n = len(groups)
         all_idx = np.arange(n)
 
-        # Pre-index by therapist for speed and determinism
         by_tid: Dict[object, np.ndarray] = {}
         for i, tid in enumerate(groups):
             by_tid.setdefault(tid, []).append(i)
@@ -878,7 +829,7 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
             for tid, idxs in by_tid.items():
                 m = len(idxs)
                 if m >= self.min_n_for_val:
-                    k = min(self.val_per_therapist, m - 1)  # keep at least 1 in train
+                    k = min(self.val_per_therapist, m - 1)
                     chosen = rs.choice(idxs, size=k, replace=False)
                     val_idx_parts.append(chosen)
                     keep = np.setdiff1d(idxs, chosen, assume_unique=False)
@@ -890,7 +841,6 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
             train_idx = np.concatenate(train_idx_parts) if train_idx_parts else np.array([], dtype=int)
             val_idx = np.concatenate(val_idx_parts) if val_idx_parts else np.array([], dtype=int)
 
-            # Safety fallback: if val is empty, do a small global split
             if len(val_idx) == 0:
                 k = max(1, int(round(self.fallback_global_val_frac * n)))
                 k = min(k, n - 1) if n > 1 else 0
@@ -898,9 +848,7 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
                     val_idx = rs.choice(all_idx, size=k, replace=False)
                     train_idx = np.setdiff1d(all_idx, val_idx, assume_unique=False)
 
-            # Final sanity
             if len(val_idx) == 0 or len(train_idx) == 0:
-                # If still degenerate, skip by making a minimal valid split (best-effort)
                 if n >= 2:
                     val_idx = np.array([0], dtype=int)
                     train_idx = np.arange(1, n, dtype=int)
@@ -921,6 +869,7 @@ class RepeatedPerTherapistHoldoutCV(BaseCrossValidator):
 
             yield train_idx, val_idx
 
+
 #####################################################################
 # Preprocessors
 #####################################################################
@@ -936,7 +885,7 @@ def make_preprocessor_common(
     elif cfg.impute_strategy == "median":
         num_imputer = SimpleImputer(strategy="median")
     elif cfg.impute_strategy == "mean":
-        num_imputer =SimpleImputer(strategy="mean", add_indicator=True)
+        num_imputer = SimpleImputer(strategy="mean", add_indicator=True)
     else:
         raise ValueError(f"Unknown impute_strategy: {cfg.impute_strategy!r}")
 
@@ -985,37 +934,26 @@ def make_preprocessor_cat_native(
     p_num: List[str], p_cat: List[str],
     t_num: List[str], t_cat: List[str]
 ) -> ColumnTransformer:
-    """
-    Preprocessor for CatBoost native categoricals (no OHE).
-    If cfg.CAT_NATIVE_HANDLE_MISSING=True:
-      - NO numeric imputation
-      - NO scaling (sklearn scalers can't handle NaN)
-      - categoricals converted to string while preserving NaN
-    """
     num_cols = (p_num or []) + (t_num or [])
     cat_cols = (p_cat or []) + (t_cat or [])
 
     transformers = []
 
     if getattr(cfg, "CAT_NATIVE_HANDLE_MISSING", True):
-        # --- native missing: pass NaNs through to CatBoost ---
         to_float = _FT(_to_float_preserve_nan_df)
         to_str_nan = _FT(_to_str_preserve_nan_df)
 
         if num_cols:
             transformers.append(("num", Pipeline([
                 ("to_float", to_float),
-                # no imputer, no scaler
             ]), num_cols))
 
         if cat_cols:
             transformers.append(("cat", Pipeline([
                 ("to_str_nan", to_str_nan),
-                # no imputer
             ]), cat_cols))
 
     else:
-        # --- legacy behavior (your current approach) ---
         if cfg.impute_strategy == "iterative":
             num_imputer = IterativeImputer(**cfg.iterative_imputer_params)
         elif cfg.impute_strategy == "median":
@@ -1053,7 +991,6 @@ def make_preprocessor_cat_native(
     except Exception:
         pass
     return ct
-
 
 
 #####################################################################
@@ -1105,7 +1042,7 @@ class RMSEScorer:
     def __call__(self, estimator: Pipeline, X_val: pd.DataFrame, y_val: np.ndarray) -> float:
         try:
             yhat = estimator.predict(X_val)
-            return -float(np.sqrt(mean_squared_error(y_val, yhat)))  # higher is better
+            return -float(np.sqrt(mean_squared_error(y_val, yhat)))
         except Exception as e:
             model_name = _model_name_from_estimator(estimator)
             print(f"[VAL ERROR][{model_name}] {type(e).__name__}: {e}")
@@ -1251,7 +1188,7 @@ def _unwrap_cat_model_from_pipeline(pipeline: Pipeline):
         inner = getattr(reg, "regressor_", None) or getattr(reg, "regressor", None)
     if isinstance(inner, CatBoostNativeWrapper):
         return inner.cb_
-    return inner  # CatBoostRegressor
+    return inner
 
 
 def cat_global_importance_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None, kind="PredictionValuesChange"):
@@ -1292,7 +1229,7 @@ def cat_shap_global_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None):
 
     pool = Pool(X_tx, label=y, cat_features=cat_idx if len(cat_idx) else None)
     shap_mat = model.get_feature_importance(pool, type=EFstrType.ShapValues)
-    shap_vals = np.asarray(shap_mat)[:, :-1]  # drop expected value col
+    shap_vals = np.asarray(shap_mat)[:, :-1]
 
     per_feat = pd.DataFrame({
         "feature": list(X_tx.columns),
@@ -1391,7 +1328,7 @@ def shap_interactions_df(fitted_pipeline: Pipeline, X_df: pd.DataFrame, y=None, 
     parent = _parent_mapping_from_pre(pre, out_feature_names=list(X_tx.columns), orig_candidates=candidates)
 
     explainer = shap.TreeExplainer(model)
-    inter = np.asarray(explainer.shap_interaction_values(X_tx))  # [n, m, m]
+    inter = np.asarray(explainer.shap_interaction_values(X_tx))
     mean_abs = np.mean(np.abs(inter), axis=0)
 
     cols = list(X_tx.columns)
@@ -1433,7 +1370,6 @@ def _interpret_available() -> bool:
 
 
 class EBMWrapper(BaseEstimator, RegressorMixin):
-    """Lazy wrapper around interpret.glassbox.ExplainableBoostingRegressor."""
     def __init__(self, **params):
         self.params = params
         self._model = None
@@ -1580,16 +1516,12 @@ class CatBoostNativeWrapper(BaseEstimator, RegressorMixin):
             if 0 <= i < len(cols):
                 c = cols[i]
                 s = X[c]
-
-                # If it's already object/string/categorical, keep it (but still ensure NaN stays NaN)
                 mask = s.isna()
                 s2 = s.astype("object")
                 s2.loc[~mask] = s2.loc[~mask].map(lambda v: str(v))
                 s2.loc[mask] = np.nan
                 X[c] = s2
-
         return X
-
 
     def fit(self, X, y):
         self.cat_idx_ = self._infer_cat_idx(X)
@@ -1641,6 +1573,7 @@ def rank_on_outcome_ols(y: np.ndarray, ranks: np.ndarray) -> Dict[str, float]:
     return {"n": float(len(y)), "beta": beta, "se": se, "p": p,
             "ci_low": ci_low, "ci_high": ci_high, "r2": r2}
 
+
 #####################################################################
 # Post-hoc regressions across runs
 #####################################################################
@@ -1649,10 +1582,6 @@ def rank_on_outcome_clustered_ols(
     ranks: np.ndarray,
     clusters: np.ndarray
 ) -> Dict[str, float]:
-    """
-    Pooled OLS: y ~ rank with SEs clustered by 'clusters' (e.g., run/fold).
-    Appropriate when each case appears once in test (e.g., single k-fold pass).
-    """
     y = np.asarray(y, float)
     r = np.asarray(ranks, float)
     g = np.asarray(clusters)
@@ -1678,7 +1607,6 @@ def rank_on_outcome_clustered_ols(
             cov_kwds={"groups": g, "use_correction": True}
         )
     except Exception:
-        # fallback to HC3 if cluster fit fails
         res = sm.OLS(y, X).fit(cov_type="HC3")
 
     params = np.asarray(res.params)
@@ -1718,14 +1646,6 @@ def rank_on_outcome_mixedlm_patient_run(
     patient_col: str,
     run_col: str,
 ) -> Dict[str, float]:
-    """
-    Mixed model: y ~ rank + (1|patient) + (1|run)
-
-    Appropriate when the SAME patient can appear in test multiple times across runs
-    (e.g., per-therapist random repeats), because it avoids pseudo-replication.
-
-    Implemented via statsmodels MixedLM with variance component for run.
-    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return {
             "n": 0.0,
@@ -1760,14 +1680,12 @@ def rank_on_outcome_mixedlm_patient_run(
             "llf": np.nan,
         }
 
-    # Ensure run is treated as categorical for the variance component
     d[run_col] = d[run_col].astype(str)
     d[patient_col] = d[patient_col].astype(str)
 
     try:
         import statsmodels.formula.api as smf
 
-        # variance component: one random intercept per run
         md = smf.mixedlm(
             f"{y_col} ~ {rank_col}",
             data=d,
@@ -1775,7 +1693,6 @@ def rank_on_outcome_mixedlm_patient_run(
             vc_formula={"run": f"0 + C({run_col})"},
         )
 
-        # try a couple optimizers
         res = None
         for method in ["lbfgs", "powell", "nm"]:
             try:
@@ -1827,9 +1744,6 @@ def rank_on_outcome_mixedlm_patient_run(
 
 
 def summarize_per_run_betas(df_posthoc_best: pd.DataFrame) -> pd.DataFrame:
-    """
-    Distribution summary of per-run betas: mean/median + 2.5%/97.5% quantiles.
-    """
     if df_posthoc_best is None or not isinstance(df_posthoc_best, pd.DataFrame) or df_posthoc_best.empty:
         return pd.DataFrame(columns=[
             "n_runs", "mean_beta", "median_beta", "sd_beta", "q025_beta", "q975_beta"
@@ -1857,7 +1771,6 @@ def summarize_per_run_betas(df_posthoc_best: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-
 #####################################################################
 # Main Pipeline
 #####################################################################
@@ -1875,6 +1788,12 @@ class MatchPipeline:
     def set_data(self, df: pd.DataFrame) -> None:
         df = df.copy()
 
+        # Normalize IDs early
+        if self.cfg.THERAPIST_ID_COL in df.columns:
+            df[self.cfg.THERAPIST_ID_COL] = df[self.cfg.THERAPIST_ID_COL].astype("string")
+        if self.cfg.PATIENT_ID_COL in df.columns:
+            df[self.cfg.PATIENT_ID_COL] = df[self.cfg.PATIENT_ID_COL].astype("string")
+
         # Ensure LABEL_COL exists (fallback optional)
         if self.cfg.LABEL_COL not in df.columns:
             phq = getattr(self.cfg, "PHQ8_T1_COL", None)
@@ -1890,8 +1809,10 @@ class MatchPipeline:
 
         # Parse date
         if self.cfg.DATE_COL in df.columns and not pdt.is_datetime64_any_dtype(df[self.cfg.DATE_COL]):
-            logger.info("date: parsing '%s' (dayfirst=%s, format=%s)",
-                        self.cfg.DATE_COL, self.cfg.DATE_DAYFIRST, self.cfg.DATE_FORMAT)
+            logger.info(
+                "date: parsing '%s' (dayfirst=%s, format=%s)",
+                self.cfg.DATE_COL, self.cfg.DATE_DAYFIRST, self.cfg.DATE_FORMAT
+            )
             df[self.cfg.DATE_COL] = pd.to_datetime(
                 df[self.cfg.DATE_COL],
                 dayfirst=self.cfg.DATE_DAYFIRST,
@@ -1919,7 +1840,6 @@ class MatchPipeline:
         if len(df_train) == 0 or len(therapists_table) == 0:
             raise ValueError("Empty train or therapist table.")
 
-        # sanity: columns must exist in both (train/val) AND the dyad template
         sample_patient = df_train.iloc[0]
         dyad_sample = build_dyads_for_patient(self.cfg, sample_patient, therapists_table.iloc[[0]])
         dyad_cols = set(dyad_sample.columns)
@@ -1947,6 +1867,59 @@ class MatchPipeline:
         mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
         return Pipeline([("preprocessor", pre), ("regressor", reg)], memory=mem)
 
+    # -----------------------------
+    # Centralized CatBoost pipeline builder (used for main + patient-only)
+    # -----------------------------
+    def _make_cat_pipeline(
+        self,
+        *,
+        p_num: List[str],
+        p_cat: List[str],
+        t_num: List[str],
+        t_cat: List[str],
+        train_dir: Optional[str],
+    ) -> Pipeline:
+        if getattr(self.cfg, "CAT_USE_NATIVE_CATEGORICAL", False):
+            # treat pre-encoded dummies as numeric
+            p_cat_native = [c for c in p_cat if not _is_preencoded_dummy(c)]
+            t_cat_native = [c for c in t_cat if not _is_preencoded_dummy(c)]
+            p_dummy_as_num = [c for c in p_cat if _is_preencoded_dummy(c)]
+            t_dummy_as_num = [c for c in t_cat if _is_preencoded_dummy(c)]
+
+            p_num_cat = _dedupe(list(p_num) + p_dummy_as_num)
+            t_num_cat = _dedupe(list(t_num) + t_dummy_as_num)
+
+            pre_cat = make_preprocessor_cat_native(self.cfg, p_num_cat, p_cat_native, t_num_cat, t_cat_native)
+
+            cat_model = CatBoostNativeWrapper(
+                loss_function="RMSE",
+                random_seed=42,
+                verbose=False,
+                task_type="CPU",
+                train_dir=train_dir,
+                allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
+            )
+            reg_cat: BaseEstimator = cat_model
+            if getattr(self.cfg, "STANDARDIZE_Y", False):
+                reg_cat = TransformedTargetRegressor(regressor=cat_model, transformer=StandardScaler())
+
+            mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
+            return Pipeline([("preprocessor", pre_cat), ("regressor", reg_cat)], memory=mem)
+
+        # OHE branch
+        return self._make_full_pipeline(
+            p_num, p_cat, t_num, t_cat,
+            CatBoostRegressor(
+                loss_function="RMSE",
+                random_seed=42,
+                verbose=False,
+                task_type="CPU",
+                train_dir=train_dir,
+                allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
+            ),
+            force_dense=True
+        )
+
     def _evaluate_on_test(
         self,
         name: str,
@@ -1959,13 +1932,11 @@ class MatchPipeline:
         *,
         compute_ranking: bool = True
     ) -> Dict:
-        # val_rmse from val_score (score = -RMSE)
         if np.isfinite(val_score) and (val_score > NEG_LARGE / 2):
             val_rmse = -float(val_score)
         else:
             val_rmse = np.inf
 
-        # If no test data, return minimal row
         if y_test is None or len(y_test) == 0 or len(df_test) == 0:
             row = {
                 "model": name,
@@ -1995,11 +1966,9 @@ class MatchPipeline:
             }
             return {"row": row, "details": details}
 
-        # observed-dyad test RMSE
         y_pred_obs = estimator.predict(X_test).astype(float)
         test_rmse = rmse(y_test, y_pred_obs)
 
-        # RMSE CI (bootstrap only)
         test_rmse_lo = test_rmse_hi = np.nan
         if getattr(self.cfg, "RMSE_CI_ENABLE", True) and len(y_test) > 1:
             test_rmse_lo, test_rmse_hi = _rmse_ci_bootstrap(
@@ -2009,7 +1978,6 @@ class MatchPipeline:
                 rng=int(getattr(self.cfg, "RMSE_CI_RANDOM_STATE", 0)),
             )
 
-        # defaults when ranking is skipped
         ranks_arr = np.array([], dtype=int)
         factual_top1_count = 0
         factual_top5_count = 0
@@ -2020,7 +1988,6 @@ class MatchPipeline:
         per_patient_df = pd.DataFrame()
 
         if compute_ranking:
-            # ranking factual therapist among all candidate therapists (per patient)
             ranks, top1_tids, top5_tids_all = [], [], []
             per_pat_rows = []
 
@@ -2038,7 +2005,7 @@ class MatchPipeline:
                 scores_eff = _s_eff(preds, self.cfg)
 
                 tids = ther_table[tid_col].astype(str).to_numpy()
-                order = np.argsort(-scores_eff)  # higher score = better
+                order = np.argsort(-scores_eff)
                 tids_ordered = tids[order]
 
                 top1_tids.append(str(tids_ordered[0]))
@@ -2064,17 +2031,14 @@ class MatchPipeline:
             per_patient_df = pd.DataFrame(per_pat_rows)
             ranks_arr = np.asarray(ranks, int)
 
-            # top-k factual hit rates
             n_pat = len(df_test)
             factual_top1_count = int(np.sum(ranks_arr == 1))
             factual_top5_count = int(np.sum(ranks_arr <= 5))
             factual_top1_share = (factual_top1_count / n_pat) if n_pat else np.nan
             factual_top5_share = (factual_top5_count / n_pat) if n_pat else np.nan
 
-            # post-hoc: outcome ~ rank
             posthoc = rank_on_outcome_ols(y_test, ranks_arr)
 
-            # therapist recommendation tallies
             if self.cfg.REPORT_TOP_COUNTS:
                 c_top1 = Counter(top1_tids)
                 c_top5 = Counter(top5_tids_all)
@@ -2100,7 +2064,6 @@ class MatchPipeline:
             "factual_top1_share": factual_top1_share,
             "factual_top5_count": factual_top5_count,
             "factual_top5_share": factual_top5_share,
-            # post-hoc association: distress ~ rank
             "rank_to_outcome_beta": float(posthoc.get("beta", np.nan)),
             "rank_to_outcome_se": float(posthoc.get("se", np.nan)),
             "rank_to_outcome_p": float(posthoc.get("p", np.nan)),
@@ -2121,7 +2084,7 @@ class MatchPipeline:
         return {"row": row, "details": details}
 
     # -----------------------------
-    # Benchmarks helpers (NEW)
+    # Benchmarks helpers
     # -----------------------------
     def _eval_from_predictions(
         self,
@@ -2131,7 +2094,6 @@ class MatchPipeline:
         y_pred: np.ndarray,
         val_rmse: float
     ) -> Dict:
-        """Build a summary-compatible row from precomputed predictions (ranking intentionally omitted)."""
         y_true = np.asarray(y_true, float)
         y_pred = np.asarray(y_pred, float)
 
@@ -2190,17 +2152,11 @@ class MatchPipeline:
         df_train: pd.DataFrame,
         df_val: pd.DataFrame
     ) -> Dict:
-        """
-        Naïve mean baseline:
-          - val_rmse: computed per CV fold (mean on training portion in each fold)
-          - test_rmse: mean computed on full y_fit applied to test
-        """
         y_fit = np.asarray(y_fit, float)
         y_test = np.asarray(y_test, float)
 
         val_rmse = np.inf
 
-        # nested strategy: fold-wise mean baseline using cv_hpo splits
         if strat in {"outer_leave_last_inner_repeated", "outer-leave-last-inner-repeated", "nested"}:
             ss = 0.0
             nn = 0
@@ -2219,8 +2175,6 @@ class MatchPipeline:
                     val_rmse = float(np.sqrt(ss / nn))
             except Exception:
                 val_rmse = np.inf
-
-        # non-nested strategy: use explicit train/val split
         else:
             if len(df_train) > 0 and len(df_val) > 0:
                 mu = float(np.mean(df_train[self.cfg.LABEL_COL].to_numpy(dtype=float)))
@@ -2241,12 +2195,8 @@ class MatchPipeline:
         if self.df is None:
             raise RuntimeError("Call set_data(df) first.")
 
-        # --------------------------
-        # Which models to run?
-        # --------------------------
         allowed = {"fm", "ridge", "cat", "ebm"}
         requested = _dedupe([str(m).strip().lower() for m in (self.cfg.RUN_MODELS or []) if str(m).strip()])
-
         if not requested:
             requested = ["fm", "ridge", "cat", "ebm"]
 
@@ -2256,17 +2206,14 @@ class MatchPipeline:
 
         strat = (self.cfg.CV_STRATEGY or "leave_last").lower()
 
-        # --- Outer split ---
+        # Outer split
         if strat in {"outer_leave_last_inner_repeated", "outer-leave-last-inner-repeated", "nested"}:
-            # Outer evaluation = "next incoming patient per therapist" (time-ordered)
             df_train, df_val, df_test = split_leave_last_test_only(
                 self.df, self.cfg.THERAPIST_ID_COL, self.cfg.DATE_COL
             )
-            # Inner CV handles tuning => df_val intentionally empty
         else:
             df_train, df_val, df_test = split_dataset(self.df, self.cfg, repeat_index=int(self._repeat_index))
 
-            # guard: if VAL is empty, create a small global validation split so PredefinedSplit works
             if len(df_val) == 0 and len(df_train) >= 4:
                 rs = np.random.RandomState(int(getattr(self.cfg, "CV_RANDOM_STATE", 0)) + int(self._repeat_index))
                 n_val = max(1, int(0.1 * len(df_train)))
@@ -2288,9 +2235,6 @@ class MatchPipeline:
 
         p_num_u, p_cat_u, t_num_u, t_cat_u = self._build_feature_lists_for_use(df_train, df_val, ther_table)
 
-        # --------------------------
-        # Zero-variance filter (train-only): patient + therapist
-        # --------------------------
         if getattr(self.cfg, "DROP_ZERO_VARIANCE_FEATURES", True):
             p_num_u2, p_cat_u2, t_num_u2, t_cat_u2, dropped = _drop_zero_variance_feature_lists(
                 df_train,
@@ -2306,34 +2250,13 @@ class MatchPipeline:
                 )
             p_num_u, p_cat_u, t_num_u, t_cat_u = p_num_u2, p_cat_u2, t_num_u2, t_cat_u2
 
-
-
-        if getattr(self.cfg, "CAT_USE_NATIVE_CATEGORICAL", False):
-            p_cat_native = [c for c in p_cat_u if not _is_preencoded_dummy(c)]
-            t_cat_native = [c for c in t_cat_u if not _is_preencoded_dummy(c)]
-
-            p_dummy_as_num = [c for c in p_cat_u if _is_preencoded_dummy(c)]
-            t_dummy_as_num = [c for c in t_cat_u if _is_preencoded_dummy(c)]
-
-            p_num_cat = _dedupe(p_num_u + p_dummy_as_num)
-            t_num_cat = _dedupe(t_num_u + t_dummy_as_num)
-        else:
-            p_cat_native, t_cat_native = p_cat_u, t_cat_u
-            p_num_cat, t_num_cat = p_num_u, t_num_u
-
-        if not t_num_u and not t_cat_u:
-            logger.warning("No therapist features in model. Consider include_therapist_id_feature=True.")
-
         base_feats = p_num_u + p_cat_u + t_num_u + t_cat_u
         extra_ids = [self.cfg.PATIENT_ID_COL]
         if self.cfg.THERAPIST_ID_COL not in base_feats:
             extra_ids.append(self.cfg.THERAPIST_ID_COL)
         tr_cols = _dedupe(base_feats + extra_ids)
 
-        # --- Data for HPO fit ---
-        # Two modes:
-        #   (A) nested: X_fit = df_train only; cv_hpo = repeated per-therapist holdout; pass groups
-        #   (B) legacy: X_fit = train+val; cv_hpo = PredefinedSplit; no groups
+        # HPO fit data
         if strat in {"outer_leave_last_inner_repeated", "outer-leave-last-inner-repeated", "nested"}:
             X_fit = df_train[tr_cols].copy()
             y_fit = df_train[self.cfg.LABEL_COL].to_numpy()
@@ -2347,16 +2270,6 @@ class MatchPipeline:
                 fallback_global_val_frac=float(getattr(self.cfg, "INNER_FALLBACK_GLOBAL_VAL_FRAC", 0.10)),
             )
             fit_kwargs = {"groups": df_train[self.cfg.THERAPIST_ID_COL].to_numpy()}
-
-            logger.info("=" * 80)
-            logger.info("[INNER CV] Using RepeatedPerTherapistHoldoutCV for HPO (nested strategy).")
-            logger.info("[INNER CV] outer_train_n=%d | therapists=%d",
-                        len(df_train), df_train[self.cfg.THERAPIST_ID_COL].nunique())
-            logger.info("[INNER CV] repeats=%d | val_per_therapist=%d | min_n_for_val=%d | fallback_global_val_frac=%.3f | base_seed=%d",
-                        cv_hpo.n_repeats, cv_hpo.val_per_therapist, cv_hpo.min_n_for_val,
-                        cv_hpo.fallback_global_val_frac, cv_hpo.base_seed)
-            logger.info("=" * 80)
-
         else:
             X_train = df_train[tr_cols].copy()
             y_train = df_train[self.cfg.LABEL_COL].to_numpy()
@@ -2370,15 +2283,10 @@ class MatchPipeline:
             cv_hpo = PredefinedSplit(test_fold)
             fit_kwargs = {}
 
-        # -------------------------------------------------
-        # Build (selected) models + GridSearchCV
-        # -------------------------------------------------
         val_scorer = RMSEScorer()
         use_ttr = bool(getattr(self.cfg, "STANDARDIZE_Y", False))
 
         def _grid_for(cfg_grid: Union[Dict[str, List[Any]], List[Dict[str, List[Any]]]]):
-            """Map pipeline param names when using TransformedTargetRegressor (TTR).
-            Supports both dict grids and list-of-dict grids (paired schedules)."""
             if not use_ttr:
                 return cfg_grid
 
@@ -2398,75 +2306,44 @@ class MatchPipeline:
         # FM
         if "fm" in requested:
             fm_pipe = self._make_full_pipeline(p_num_u, p_cat_u, t_num_u, t_cat_u, TorchFMRegressor(), force_dense=False)
-            fm_gs = GridSearchCV(
+            gs_by_name["fm"] = GridSearchCV(
                 fm_pipe, _grid_for(self.cfg.fm_param_grid),
                 scoring=val_scorer, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
                 error_score=NEG_LARGE
             )
-            gs_by_name["fm"] = fm_gs
 
         # Ridge
         if "ridge" in requested:
             ridge_pipe = self._make_full_pipeline(p_num_u, p_cat_u, t_num_u, t_cat_u, RidgeRegressor(), force_dense=False)
-            ridge_gs = GridSearchCV(
+            gs_by_name["ridge"] = GridSearchCV(
                 ridge_pipe, _grid_for(self.cfg.ridge_param_grid),
                 scoring=val_scorer, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
                 error_score=NEG_LARGE
             )
-            gs_by_name["ridge"] = ridge_gs
 
         # CatBoost
         if "cat" in requested:
-            # CatBoost (CPU)
             train_dir = None
             if self.run_dir is not None:
                 cb_info = (self.run_dir / "catboost_info")
                 cb_info.mkdir(parents=True, exist_ok=True)
                 train_dir = str(cb_info.resolve())
 
-            if getattr(self.cfg, "CAT_USE_NATIVE_CATEGORICAL", False):
-                pre_cat = make_preprocessor_cat_native(self.cfg, p_num_cat, p_cat_native, t_num_cat, t_cat_native)
-
-                cat_model = CatBoostNativeWrapper(
-                    loss_function="RMSE",
-                    random_seed=42,
-                    verbose=False,
-                    task_type="CPU",
-                    train_dir=train_dir,
-                    allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
-                )
-                reg_cat: BaseEstimator = cat_model
-                if getattr(self.cfg, "STANDARDIZE_Y", False):
-                    reg_cat = TransformedTargetRegressor(regressor=cat_model, transformer=StandardScaler())
-                mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
-                cat_pipe = Pipeline([("preprocessor", pre_cat), ("regressor", reg_cat)], memory=mem)
-            else:
-                cat_pipe = self._make_full_pipeline(
-                    p_num_u, p_cat_u, t_num_u, t_cat_u,
-                    CatBoostRegressor(
-                        loss_function="RMSE",
-                        random_seed=42,
-                        verbose=False,
-                        task_type="CPU",
-                        train_dir=train_dir,
-                        allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
-                    ),
-                    force_dense=True
-                )
-
-            cat_gs = GridSearchCV(
+            cat_pipe = self._make_cat_pipeline(
+                p_num=p_num_u, p_cat=p_cat_u, t_num=t_num_u, t_cat=t_cat_u, train_dir=train_dir
+            )
+            gs_by_name["cat"] = GridSearchCV(
                 cat_pipe, _grid_for(self.cfg.cat_param_grid),
                 scoring=val_scorer, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
                 error_score=NEG_LARGE
             )
-            gs_by_name["cat"] = cat_gs
 
-        # EBM (optional)
+        # EBM
         if "ebm" in requested:
             if not _interpret_available():
                 logger.warning("interpret not found; skipping EBM model.")
             else:
-                pre_ebm = make_preprocessor_common(self.cfg, p_num_u, p_cat_u, t_num_u, t_cat_u, force_dense_ohe=False)
+                pre_ebm = make_preprocessor_common(self.cfg, p_num_u, p_cat_u, t_num_u, t_cat_u, force_dense_ohe=True)
                 ebm_model = EBMWrapper()
                 reg_ebm: BaseEstimator = ebm_model
                 if getattr(self.cfg, "STANDARDIZE_Y", False):
@@ -2474,17 +2351,15 @@ class MatchPipeline:
                 mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
                 ebm_pipe = Pipeline([("preprocessor", pre_ebm), ("regressor", reg_ebm)], memory=mem)
 
-                ebm_gs = GridSearchCV(
+                gs_by_name["ebm"] = GridSearchCV(
                     ebm_pipe, _grid_for(self.cfg.ebm_param_grid),
                     scoring=val_scorer, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
                     error_score=NEG_LARGE
                 )
-                gs_by_name["ebm"] = ebm_gs
 
         if not gs_by_name:
             raise RuntimeError("No models selected to run (after availability checks).")
 
-        # Fit selected models
         for mname, gs in gs_by_name.items():
             logger.info("[Fitting] %s", mname)
             gs.fit(X_fit, y_fit, **fit_kwargs)
@@ -2493,7 +2368,6 @@ class MatchPipeline:
         X_test = df_test[tr_cols].copy() if len(df_test) else df_test.iloc[0:0][tr_cols].copy()
         y_test = df_test[self.cfg.LABEL_COL].to_numpy() if len(df_test) else np.array([], float)
 
-        # evaluate all fitted models
         candidates = []
         for mname, gs in gs_by_name.items():
             candidates.append((mname, gs.best_estimator_, gs.best_score_, gs))
@@ -2512,7 +2386,7 @@ class MatchPipeline:
 
         df_sum = pd.DataFrame(results_rows)
 
-        # pick best model by val_rmse (finite), else by test_rmse  (NOTE: benchmarks are added later and do NOT affect selection)
+        # select best model by val_rmse (finite) else test_rmse; benchmarks do not affect selection
         if len(df_sum):
             valid = df_sum[np.isfinite(df_sum["val_rmse"]) & (df_sum["val_rmse"] < np.inf)].copy()
             if len(valid):
@@ -2526,14 +2400,13 @@ class MatchPipeline:
         logger.info("[Selected] %s | policy=validation", best_name)
 
         # -------------------------------------------------
-        # Benchmarks (NEW): naive mean + patient-only
-        # These are appended to df_sum but do NOT affect best_name selection above.
+        # Benchmarks
         # -------------------------------------------------
         benchmark_rows = []
         benchmark_details = {}
         benchmark_reco = {}
 
-        # Naïve mean baseline (fold-wise mean in validation)
+        # Naive mean baseline
         if getattr(self.cfg, "INCLUDE_NAIVE_MEAN_BASELINE", True):
             groups_arr = fit_kwargs.get("groups") if isinstance(fit_kwargs, dict) else None
             base_out = self._naive_mean_baseline(
@@ -2551,141 +2424,68 @@ class MatchPipeline:
             benchmark_details["naive_mean"] = base_out["details"]
             benchmark_reco["naive_mean"] = pd.DataFrame()
 
-        # Patient-only benchmark: refit best architecture without therapist features
+        # NEW (requested): Patient-only benchmark is ALWAYS CatBoost (fixed architecture)
         if getattr(self.cfg, "INCLUDE_PATIENT_ONLY_BENCHMARK", True):
             if (len(p_num_u) + len(p_cat_u)) == 0:
                 logger.warning("Patient-only benchmark skipped: no patient features configured.")
             else:
-                best_arch = best_name  # one of {"fm","ridge","cat","ebm"}
-
                 # patient-only matrices (keep patient_id as harmless column)
                 po_cols = _dedupe(p_num_u + p_cat_u + [self.cfg.PATIENT_ID_COL])
                 X_fit_po = X_fit.reindex(columns=po_cols, fill_value=np.nan)
                 X_test_po = X_test.reindex(columns=po_cols, fill_value=np.nan)
 
-                val_scorer_po = RMSEScorer()
-                use_ttr_po = bool(getattr(self.cfg, "STANDARDIZE_Y", False))
+                train_dir_po = None
+                if self.run_dir is not None:
+                    cb_info_po = (self.run_dir / "catboost_info_patient_only")
+                    cb_info_po.mkdir(parents=True, exist_ok=True)
+                    train_dir_po = str(cb_info_po.resolve())
 
-                _grid_for_po = _grid_for
+                po_pipe = self._make_cat_pipeline(
+                    p_num=p_num_u,
+                    p_cat=p_cat_u,
+                    t_num=[],
+                    t_cat=[],
+                    train_dir=train_dir_po,
+                )
 
-                gs_po = None
+                gs_po = GridSearchCV(
+                    po_pipe, _grid_for(self.cfg.cat_param_grid),
+                    scoring=val_scorer, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
+                    error_score=NEG_LARGE
+                )
 
-                if best_arch == "fm":
-                    po_pipe = self._make_full_pipeline(p_num_u, p_cat_u, [], [], TorchFMRegressor(), force_dense=False)
-                    gs_po = GridSearchCV(
-                        po_pipe, _grid_for_po(self.cfg.fm_param_grid),
-                        scoring=val_scorer_po, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
-                        error_score=NEG_LARGE
-                    )
+                logger.info("[Patient-only benchmark] fitting fixed CatBoost architecture on patient-only features.")
+                gs_po.fit(X_fit_po, y_fit, **fit_kwargs)
 
-                elif best_arch == "ridge":
-                    po_pipe = self._make_full_pipeline(p_num_u, p_cat_u, [], [], RidgeRegressor(), force_dense=False)
-                    gs_po = GridSearchCV(
-                        po_pipe, _grid_for_po(self.cfg.ridge_param_grid),
-                        scoring=val_scorer_po, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
-                        error_score=NEG_LARGE
-                    )
+                est_po = gs_po.best_estimator_
+                val_score_po = gs_po.best_score_
+                eval_po = self._evaluate_on_test(
+                    name="patient_only_cat",
+                    estimator=est_po,
+                    X_test=X_test_po,
+                    y_test=y_test,
+                    df_test=df_test,
+                    ther_table=ther_table,
+                    val_score=val_score_po,
+                    compute_ranking=False
+                )
+                benchmark_rows.append(eval_po["row"])
+                benchmark_details["patient_only_cat"] = eval_po["details"]
+                benchmark_reco["patient_only_cat"] = pd.DataFrame()
 
-                elif best_arch == "cat":
-                    train_dir_po = None
-                    if self.run_dir is not None:
-                        cb_info_po = (self.run_dir / "catboost_info_patient_only")
-                        cb_info_po.mkdir(parents=True, exist_ok=True)
-                        train_dir_po = str(cb_info_po.resolve())
-
-                    if getattr(self.cfg, "CAT_USE_NATIVE_CATEGORICAL", False):
-                        p_cat_native_po = [c for c in p_cat_u if not _is_preencoded_dummy(c)]
-                        p_dummy_as_num_po = [c for c in p_cat_u if _is_preencoded_dummy(c)]
-                        p_num_cat_po = _dedupe(p_num_u + p_dummy_as_num_po)
-
-                        pre_po = make_preprocessor_cat_native(self.cfg, p_num_cat_po, p_cat_native_po, [], [])
-                        cat_model_po = CatBoostNativeWrapper(
-                            loss_function="RMSE",
-                            random_seed=42,
-                            verbose=False,
-                            task_type="CPU",
-                            train_dir=train_dir_po,
-                            allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
-                        )
-                        reg_po = cat_model_po
-                        if getattr(self.cfg, "STANDARDIZE_Y", False):
-                            reg_po = TransformedTargetRegressor(regressor=cat_model_po, transformer=StandardScaler())
-                        mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
-                        po_pipe = Pipeline([("preprocessor", pre_po), ("regressor", reg_po)], memory=mem)
-                    else:
-                        po_pipe = self._make_full_pipeline(
-                            p_num_u, p_cat_u, [], [],
-                            CatBoostRegressor(
-                                loss_function="RMSE",
-                                random_seed=42,
-                                verbose=False,
-                                task_type="CPU",
-                                train_dir=train_dir_po,
-                                allow_writing_files=bool(getattr(self.cfg, "CATBOOST_ALLOW_WRITING_FILES", True)),
-                            ),
-                            force_dense=True
-                        )
-
-                    gs_po = GridSearchCV(
-                        po_pipe, _grid_for_po(self.cfg.cat_param_grid),
-                        scoring=val_scorer_po, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
-                        error_score=NEG_LARGE
-                    )
-
-                elif best_arch == "ebm":
-                    if not _interpret_available():
-                        logger.warning("Patient-only benchmark for EBM skipped: interpret not installed.")
-                        gs_po = None
-                    else:
-                        pre_po = make_preprocessor_common(self.cfg, p_num_u, p_cat_u, [], [], force_dense_ohe=False)
-                        ebm_model_po = EBMWrapper()
-                        reg_po = ebm_model_po
-                        if getattr(self.cfg, "STANDARDIZE_Y", False):
-                            reg_po = TransformedTargetRegressor(regressor=ebm_model_po, transformer=StandardScaler())
-                        mem = Memory(location=self.cfg.CACHE_DIR, verbose=0) if getattr(self.cfg, "CACHE_STEPS", False) else None
-                        po_pipe = Pipeline([("preprocessor", pre_po), ("regressor", reg_po)], memory=mem)
-
-                        gs_po = GridSearchCV(
-                            po_pipe, _grid_for_po(self.cfg.ebm_param_grid),
-                            scoring=val_scorer_po, refit=True, cv=cv_hpo, n_jobs=1, verbose=2,
-                            error_score=NEG_LARGE
-                        )
-
-                if gs_po is not None:
-                    logger.info("[Patient-only benchmark] refitting best architecture without therapist features: %s", best_arch)
-                    gs_po.fit(X_fit_po, y_fit, **fit_kwargs)
-
-                    est_po = gs_po.best_estimator_
-                    val_score_po = gs_po.best_score_
-                    eval_po = self._evaluate_on_test(
-                        name=f"patient_only_{best_arch}",
-                        estimator=est_po,
-                        X_test=X_test_po,
-                        y_test=y_test,
-                        df_test=df_test,
-                        ther_table=ther_table,
-                        val_score=val_score_po,
-                        compute_ranking=False
-                    )
-                    benchmark_rows.append(eval_po["row"])
-                    benchmark_details[f"patient_only_{best_arch}"] = eval_po["details"]
-                    benchmark_reco[f"patient_only_{best_arch}"] = pd.DataFrame()
-
-        # append benchmarks to summary + details maps (but keep best_name unchanged)
+        # append benchmarks
         if benchmark_rows:
             df_bench = pd.DataFrame(benchmark_rows)
             df_sum = pd.concat([df_sum, df_bench], ignore_index=True, sort=False)
-
             details_by_model.update(benchmark_details)
             therapist_reco_by_model.update(benchmark_reco)
 
-        # sort summary (by val_rmse then test_rmse)
         df_sum = df_sum.sort_values(
             by=["val_rmse", "test_rmse"],
             ascending=[True, True]
         ).reset_index(drop=True)
 
-        # ---------- Explanations (Cat if present; EBM if present) ----------
+        # Explanations placeholders (kept)
         self.test_details_.update({
             "cat_model_importance_agg": pd.DataFrame(columns=["orig_feature", "importance"]),
             "cat_model_interactions_agg": pd.DataFrame(columns=["orig_i", "orig_j", "score"]),
@@ -2705,7 +2505,6 @@ class MatchPipeline:
             else:
                 X_imp, y_imp = X_imp_full, y_imp_full
 
-            # CatBoost explanations (only if cat was run)
             cat_est = cand_map.get("cat", (None,))[0]
             if cat_est is not None:
                 if self.cfg.EXPLAIN_COMPUTE_FI:
@@ -2721,13 +2520,11 @@ class MatchPipeline:
                     _sints_ohe, sints_agg = shap_interactions_df(cat_est, X_imp, y_imp, top_k=self.cfg.EXPLAIN_TOPK)
                     self.test_details_["cat_model_shap_interactions_agg"] = sints_agg
 
-            # EBM explanations (only if ebm was run)
             ebm_est = cand_map.get("ebm", (None,))[0]
             if ebm_est is not None:
                 ebm_model = _unwrap_ebm_from_pipeline(ebm_est)
                 if ebm_model is not None:
                     imp_df = ebm_global_importance_df(ebm_model)
-                    # crude but stable aggregation: split "a x b" into base features
                     rows = []
                     term_names = imp_df.get("term", [])
                     term_imps = imp_df.get("importance", [])
@@ -2741,7 +2538,7 @@ class MatchPipeline:
                     term_table = pd.DataFrame(rows)
                     feat_agg = ebm_aggregate_base_feature_importance(term_table)
                     self.test_details_["ebm_model_importance_agg"] = feat_agg.head(self.cfg.EXPLAIN_TOPK)
-                    # interactions (top terms that look like interactions)
+
                     inter_terms = term_table[term_table["type"] == "interaction"].copy()
                     inter_terms = inter_terms.sort_values("importance", ascending=False).head(self.cfg.EXPLAIN_TOPK)
                     top_pairs = _pairs_from_interactions_table(inter_terms.rename(columns={"importance": "importance"}))
@@ -2749,7 +2546,6 @@ class MatchPipeline:
         except Exception as e:
             logger.warning("Explanations failed: %s: %s", type(e).__name__, e)
 
-        # Example scores for first test patient (best model)
         example_scores = pd.DataFrame()
         if len(df_test) > 0:
             try:
@@ -2759,12 +2555,11 @@ class MatchPipeline:
                 example_scores["predicted_outcome"] = best_model.predict(example_scores).astype(float)
                 example_scores = example_scores[[self.cfg.THERAPIST_ID_COL, "predicted_outcome"]].sort_values(
                     "predicted_outcome",
-                    ascending=(not self.cfg.OUTCOME_HIGHER_IS_BETTER)  # for distress: ascending = better
+                    ascending=(not self.cfg.OUTCOME_HIGHER_IS_BETTER)
                 ).reset_index(drop=True)
             except Exception as e:
                 logger.warning("[Example scores] %s: %s", type(e).__name__, e)
 
-        # stash details
         self.test_details_ = {
             **self.test_details_,
             "models": details_by_model,
@@ -2787,7 +2582,7 @@ class MatchPipeline:
         best_reco = therapist_reco_by_model.get(best_name, pd.DataFrame())
 
         return {
-            "summary": df_sum,  # NOTE: no "val_failed" column anymore
+            "summary": df_sum,
             "therapists": ther_table_out,
             "therapist_recommendations": best_reco,
         }
@@ -2798,12 +2593,12 @@ class MatchPipeline:
 #####################################################################
 def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     """
-    Implements:
-      - deterministic run folder: ./model_outputs/run_<YYYYMMDD_HH>[_vK]
-      - per-repeat subfolders: .../repeat_00, repeat_01, ...
-      - CatBoost writes into .../catboost_info
-      - caching (optional) lives inside the same folder
-      - saves outputs (tables/explanations/meta) automatically when OUTPUT_SAVE=True
+    Key behavior (updated per request):
+      - Repeated runs: out["summary"] is now AGGREGATED across runs (val+test mean/sd/min/max),
+        and out["summary_last_run"] stores the last run's per-model table.
+      - Patient-only benchmark is ALWAYS CatBoost on patient-only features (name: "patient_only_cat"),
+        so it aggregates cleanly across runs as a single row.
+      - run_meta.json includes seeds + CAT_* settings.
     """
     n_rep = int(getattr(cfg, "CV_N_REPEATS", 1) or 1)
     strat = (cfg.CV_STRATEGY or "leave_last").lower()
@@ -2813,20 +2608,24 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     else:
         n_rep = int(getattr(cfg, "CV_N_REPEATS", 1) or 1)
 
-
     def _df_or_empty(obj, cols):
         return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame(columns=cols)
 
     def _attach_details(out: Dict[str, object], pipe: MatchPipeline) -> Dict[str, object]:
-        """Add convenience fields + explanation tables to the out dict (single run)."""
         out = dict(out or {})
         out["used_features"] = pipe.test_details_.get("used_features", {})
         out["best_model_name"] = pipe.test_details_.get("best_model_name")
-        out["best_params"] = pipe.test_details_.get("best_params")  # single-run OK
+        out["best_params"] = pipe.test_details_.get("best_params")
         out["example_scores_first_test_patient"] = pipe.test_details_.get(
             "example_scores_first_test_patient", pd.DataFrame()
         )
         out["run_models"] = pipe.test_details_.get("run_models", getattr(cfg, "RUN_MODELS", None))
+
+        # NEW: expose settings for meta
+        out["cv_strategy"] = str(getattr(cfg, "CV_STRATEGY", None))
+        out["cv_random_state"] = int(getattr(cfg, "CV_RANDOM_STATE", 0))
+        out["cat_use_native_categorical"] = bool(getattr(cfg, "CAT_USE_NATIVE_CATEGORICAL", False))
+        out["cat_native_handle_missing"] = bool(getattr(cfg, "CAT_NATIVE_HANDLE_MISSING", False))
 
         out["cat_model_importance_agg"] = _df_or_empty(
             pipe.test_details_.get("cat_model_importance_agg"), ["orig_feature", "importance"]
@@ -2864,6 +2663,10 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
         )
         return out
 
+    def _split_seed_for_repeat(cfg: MatchConfig, repeat_index: int) -> int:
+        # A simple, user-facing summary seed (the real split is deterministic by (base_seed, repeat_index, therapist_id))
+        return int(getattr(cfg, "CV_RANDOM_STATE", 0)) + int(repeat_index)
+
     def _run_once(*, repeat_index: int, out_dir: Path) -> Tuple[Dict[str, object], MatchPipeline]:
         pipe = MatchPipeline(cfg, run_dir=out_dir)
         pipe.set_data(df)
@@ -2872,6 +2675,10 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
 
         out = _attach_details(out, pipe)
         out["output_dir"] = str(out_dir)
+
+        # NEW: meta fields per run
+        out["repeat_index"] = int(repeat_index)
+        out["split_seed"] = int(_split_seed_for_repeat(cfg, repeat_index))
 
         if getattr(cfg, "OUTPUT_SAVE", True):
             _save_outputs_bundle(str(out_dir), out)
@@ -2882,7 +2689,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     # Single run
     # ------------------------------------------------------------------
     if not (n_rep > 1 and strat in {"per_therapist_random", "per-therapist-random", "ptr", "kfold", "k_fold", "kf"}):
-
         out_dir = _init_run_context(cfg, repeat_index=None)
         out, _pipe = _run_once(repeat_index=0, out_dir=out_dir)
         return out
@@ -2890,7 +2696,7 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     # ------------------------------------------------------------------
     # Repeated runs
     # ------------------------------------------------------------------
-    base_dir = _init_run_context(cfg, repeat_index=None)  # creates base + sets cfg.OUTPUT_RUN_DIR
+    base_dir = _init_run_context(cfg, repeat_index=None)
 
     run_summaries = []
     best_rows = []
@@ -2900,7 +2706,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     cat_fi_runs, cat_int_runs = [], []
     shap_main_runs, shap_int_runs = [], []
     ebm_fi_runs, ebm_int_runs = [], []
-
     ther_best_runs = []
 
     outs_last = None
@@ -2932,7 +2737,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
                 best_row["run"] = r
                 best_rows.append(best_row.iloc[[0]])
 
-        # per-patient rank/outcome for best model
         rtab_map = out_r.get("rank_outcome_table_by_model", {}) or {}
         best_name = out_r.get("best_model_name")
         rtab = rtab_map.get(best_name)
@@ -2942,7 +2746,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
             t["best_model"] = best_name
             rank_tabs.append(t)
 
-        # posthoc rank~outcome (best model)
         posthoc_map = out_r.get("posthoc_rank_on_outcome_by_model", {}) or {}
         posthoc = posthoc_map.get(best_name, {}) or {}
         if posthoc:
@@ -2958,7 +2761,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
                 "r2": float(posthoc.get("r2", np.nan)),
             })
 
-        # therapist reco counts for best model
         reco_map = out_r.get("therapist_recommendation_counts_by_model", {}) or {}
         reco_best = reco_map.get(best_name)
         if isinstance(reco_best, pd.DataFrame) and len(reco_best):
@@ -2967,7 +2769,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
             tb["best_model"] = best_name
             ther_best_runs.append(tb)
 
-        # collect Cat / EBM explanation tables (per run)
         cfi = out_r.get("cat_model_importance_agg")
         if isinstance(cfi, pd.DataFrame) and len(cfi):
             t = cfi.rename(columns={"orig_feature": "feature", "importance": "importance"}).copy()
@@ -3093,9 +2894,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
 
     rank_outcome_all = pd.concat(rank_tabs, ignore_index=True) if rank_tabs else pd.DataFrame()
 
-        # -------------------------------------------------------------
-    # Post-hoc regression across runs (NEW)
-    # -------------------------------------------------------------
     cv_posthoc_pooled_clustered = pd.DataFrame()
     cv_posthoc_mixedlm = pd.DataFrame()
     cv_beta_distribution = pd.DataFrame()
@@ -3104,7 +2902,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     is_kfold = strat_norm in {"kfold", "k_fold", "kf"}
     is_ptr = strat_norm in {"per_therapist_random", "per-therapist-random", "ptr"}
 
-    # 1) k-fold: pooled OLS with SEs clustered by run/fold
     if is_kfold and isinstance(rank_outcome_all, pd.DataFrame) and len(rank_outcome_all):
         try:
             pooled = rank_on_outcome_clustered_ols(
@@ -3112,16 +2909,10 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
                 ranks=rank_outcome_all["factual_rank"].to_numpy(dtype=float),
                 clusters=rank_outcome_all["run"].to_numpy(),
             )
-            pooled_row = {
-                "approach": "pooled_ols_cluster_se_by_run",
-                **pooled,
-            }
-            cv_posthoc_pooled_clustered = pd.DataFrame([pooled_row])
+            cv_posthoc_pooled_clustered = pd.DataFrame([{"approach": "pooled_ols_cluster_se_by_run", **pooled}])
         except Exception as e:
             logger.warning("Clustered pooled OLS failed: %s: %s", type(e).__name__, e)
-            cv_posthoc_pooled_clustered = pd.DataFrame()
 
-    # 2) per-therapist random repeats: mixed model (1|patient) + (1|run)
     if is_ptr and isinstance(rank_outcome_all, pd.DataFrame) and len(rank_outcome_all):
         try:
             mixed = rank_on_outcome_mixedlm_patient_run(
@@ -3131,36 +2922,53 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
                 patient_col=cfg.PATIENT_ID_COL,
                 run_col="run",
             )
-            mixed_row = {
-                "approach": "mixedlm_(1|patient)+(1|run)",
-                **mixed,
-            }
-            cv_posthoc_mixedlm = pd.DataFrame([mixed_row])
+            cv_posthoc_mixedlm = pd.DataFrame([{"approach": "mixedlm_(1|patient)+(1|run)", **mixed}])
         except Exception as e:
             logger.warning("MixedLM posthoc failed: %s: %s", type(e).__name__, e)
-            cv_posthoc_mixedlm = pd.DataFrame()
 
-        # 3) distribution summary of per-run betas (best model each run)
         cv_beta_distribution = summarize_per_run_betas(df_posthoc_best)
 
-
     cv_ther_best_all = pd.concat(ther_best_runs, ignore_index=True) if ther_best_runs else pd.DataFrame()
-    cv_ther_best_mean = pd.DataFrame()
-    if isinstance(cv_ther_best_all, pd.DataFrame) and len(cv_ther_best_all):
-        tid = cfg.THERAPIST_ID_COL
-        agg_cols = [c for c in ["top1_count", "top5_count", "top1_share", "top5_share", "n_test_patients"] if c in cv_ther_best_all.columns]
-        if agg_cols and tid in cv_ther_best_all.columns:
-            cv_ther_best_mean = (
-                cv_ther_best_all.groupby(tid, as_index=False)[agg_cols]
-                .agg(["mean", "std", "sum", "count"])
+
+    # ------------------------------------------------------------------
+    # NEW (requested): build aggregated summary across runs into out["summary"]
+    # ------------------------------------------------------------------
+    summary_agg = pd.DataFrame()
+    if isinstance(df_runs, pd.DataFrame) and len(df_runs):
+        d = df_runs.copy()
+        for c in ["val_rmse", "test_rmse"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+        summary_agg = (
+            d.groupby("model", as_index=False)
+            .agg(
+                n_runs=("run", "nunique"),
+                val_mean=("val_rmse", "mean"),
+                val_sd=("val_rmse", "std"),
+                val_min=("val_rmse", "min"),
+                val_max=("val_rmse", "max"),
+                test_mean=("test_rmse", "mean"),
+                test_sd=("test_rmse", "std"),
+                test_min=("test_rmse", "min"),
+                test_max=("test_rmse", "max"),
             )
-            cv_ther_best_mean.columns = [f"{a}_{b}" if b else str(a) for (a, b) in cv_ther_best_mean.columns.to_list()]
-            cv_ther_best_mean = cv_ther_best_mean.reset_index(drop=True)
-            order_key = "top1_share_mean" if "top1_share_mean" in cv_ther_best_mean.columns else (
-                "top1_count_sum" if "top1_count_sum" in cv_ther_best_mean.columns else None
+        )
+
+        if isinstance(df_best, pd.DataFrame) and len(df_best) and "model" in df_best.columns:
+            sel = (
+                df_best["model"].value_counts(dropna=False)
+                .rename_axis("model")
+                .reset_index(name="selected_as_best_count")
             )
-            if order_key is not None:
-                cv_ther_best_mean = cv_ther_best_mean.sort_values(order_key, ascending=False).reset_index(drop=True)
+            summary_agg = summary_agg.merge(sel, on="model", how="left")
+        else:
+            summary_agg["selected_as_best_count"] = 0
+
+        summary_agg["selected_as_best_count"] = (
+            pd.to_numeric(summary_agg["selected_as_best_count"], errors="coerce").fillna(0).astype(int)
+        )
+        summary_agg = summary_agg.sort_values("test_mean", ascending=True).reset_index(drop=True)
 
     out = dict(outs_last or {})
     out["output_dir"] = str(base_dir)
@@ -3175,7 +2983,6 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     out["cv_best_policy_summary"] = df_best
     out["cv_best_model_by_run"] = df_best
     out["cv_selected_model_counts"] = cv_selected_model_counts
-
     out["cv_rmse_stats_per_model"] = rmse_stats_per_model
     out["cv_rmse_stats_best"] = rmse_stats_best
 
@@ -3187,15 +2994,25 @@ def run_pipeline(df: pd.DataFrame, cfg: MatchConfig) -> Dict[str, object]:
     out["cv_cat_shap_interactions_mean"] = cv_cat_shap_interactions_mean
 
     out["cv_rank_outcome_all_runs"] = rank_outcome_all
-    out["cv_outcomes_all_runs"] = rank_outcome_all
     out["cv_posthoc_best_by_run"] = df_posthoc_best
     out["cv_posthoc_pooled_clustered_ols"] = cv_posthoc_pooled_clustered
     out["cv_posthoc_mixedlm"] = cv_posthoc_mixedlm
     out["cv_posthoc_beta_distribution"] = cv_beta_distribution
 
-
     out["cv_therapist_recommendations_best_all_runs"] = cv_ther_best_all
-    out["cv_therapist_recommendations_best_mean"] = cv_ther_best_mean
+
+    # NEW: seeds list for meta
+    out["seeds_by_run"] = [{"run": int(r), "split_seed": int(getattr(cfg, "CV_RANDOM_STATE", 0) + r)} for r in range(n_rep)]
+
+    # NEW: summary handling for repeated runs
+    out["summary_last_run"] = out.get("summary")  # keep last run's per-model table
+    out["summary"] = summary_agg                 # overwrite with aggregated across runs
+
+    # also ensure meta fields exist at base out
+    out["cv_strategy"] = str(getattr(cfg, "CV_STRATEGY", None))
+    out["cv_random_state"] = int(getattr(cfg, "CV_RANDOM_STATE", 0))
+    out["cat_use_native_categorical"] = bool(getattr(cfg, "CAT_USE_NATIVE_CATEGORICAL", False))
+    out["cat_native_handle_missing"] = bool(getattr(cfg, "CAT_NATIVE_HANDLE_MISSING", False))
 
     if getattr(cfg, "OUTPUT_SAVE", True):
         _save_outputs_bundle(str(base_dir), out)
